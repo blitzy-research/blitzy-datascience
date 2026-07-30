@@ -559,3 +559,203 @@ def test_rule5_checkpoint_round_trip_alias(tmp_path: Path) -> None:
     cp.mark_completed("games", "0022500001")
     cp2 = CheckpointManager(path=tmp_path / "cp.json")
     assert cp2.is_completed("games", "0022500001") is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.15 — `get_pending` duplicate / element-type / order guarantees
+# ---------------------------------------------------------------------------
+#
+# The four tests below pin the three semantics of
+# :meth:`utils.checkpoint.CheckpointManager.get_pending` that the five
+# pre-existing ``get_pending`` tests in Phase 2.6 above leave unasserted.
+# Every expected value is derived BY HAND from the two statements that
+# constitute the method's body in ``utils/checkpoint.py`` (lines 542-548)::
+#
+#     with self._lock:
+#         completed = set(self._state.get(domain, {}).keys())
+#     return [k for k in all_keys if str(k) not in completed]
+#
+# Three facts follow directly from those two statements, and each is
+# pinned by the tests that follow:
+#   1. The ``set()`` is applied to the COMPLETED keys, never to
+#      ``all_keys`` — so duplicates in the input survive verbatim.
+#   2. ``str(k)`` is evaluated ONLY inside the membership test and its
+#      result is then discarded — so the returned list holds the
+#      ORIGINAL element objects with their original types, exactly as
+#      the method docstring (lines 516-520) promises: "the returned
+#      list contains the original elements verbatim".
+#   3. The predicate is evaluated independently for EVERY element — so
+#      marking one key filters every duplicate of it, not just the
+#      first occurrence.
+#
+# The fault these four tests exist to catch is one plausible mutation:
+# wrapping ``all_keys`` in ``set()`` "for efficiency". That would
+# silently drop legitimate duplicate keys AND silently reorder the fetch
+# sequence, destroying the chronological ``GAME_ID`` replay determinism
+# the pipelines depend on. The sibling ``[str(k) for k in all_keys ...]``
+# mutation would additionally break the element-type guarantee.
+#
+# Each test below is paired with exactly one mutant that it detects
+# DETERMINISTICALLY:
+#   * ``set(all_keys)``            -> the duplicate-input test, because
+#     the three-element input collapses to two elements regardless of
+#     the set's iteration order, so the length assertion always fires.
+#   * remove-first-occurrence-only -> the every-duplicate test.
+#   * ``[str(k) for k in ...]``    -> the element-type test.
+#   * ``sorted(...)``              -> the input-order test.
+#
+# None of those four mutants is reliably caught by the pre-existing
+# Phase 2.6 tests: ``sorted(...)``, ``[str(k) ...]`` and
+# remove-first-occurrence leave all five of them green, and ``set()`` is
+# caught by the Phase 2.6 order test only incidentally — only when
+# CPython's per-process string-hash randomization happens to produce a
+# set ordering that differs from the input ordering, which is not a
+# dependable signal.
+# ---------------------------------------------------------------------------
+
+
+def test_get_pending_does_not_deduplicate_duplicate_input_keys(tmp_path: Path) -> None:
+    """``get_pending`` must NOT deduplicate its own ``all_keys`` input.
+
+    Hand derivation — nothing is marked completed, so ``completed`` is
+    the empty set; the comprehension at ``utils/checkpoint.py`` line 548
+    then evaluates ``str(k) not in completed`` independently for each of
+    the three elements of ``["a", "a", "b"]`` and every one passes, so
+    all three survive in input order — including the repeated ``"a"``.
+
+    Deterministically detects the ``set(all_keys)`` /
+    ``dict.fromkeys(all_keys)`` "efficiency" mutation: either one
+    collapses the three-element input to two elements, so the length
+    assertion below fires no matter which order the collapsed container
+    happens to iterate in.
+    """
+    # Arrange — a fresh manager with nothing marked completed.
+    cp = CheckpointManager(path=tmp_path / "cp.json")
+
+    # Act — supply the same key twice.
+    pending = cp.get_pending("games", ["a", "a", "b"])
+
+    # Assert — the whole ordered list, duplicate included.
+    assert pending == ["a", "a", "b"], (
+        "get_pending must not deduplicate its own input (utils/checkpoint.py L548 is a plain "
+        f"order-preserving comprehension); expected ['a', 'a', 'b'] but got {pending!r}"
+    )
+    assert len(pending) == 3, (
+        "get_pending must return all 3 supplied keys when none is completed; got "
+        f"{len(pending)} element(s): {pending!r}"
+    )
+
+
+def test_get_pending_filters_every_duplicate_of_a_completed_key(tmp_path: Path) -> None:
+    """A completed key filters EVERY duplicate of itself, not just the first.
+
+    Hand derivation — ``mark_completed("games", "a")`` makes
+    ``completed == {"a"}``; the comprehension at ``utils/checkpoint.py``
+    line 548 then evaluates the predicate independently for each element
+    of ``["a", "a", "b"]``, so BOTH ``"a"`` entries are dropped and only
+    ``"b"`` survives.
+
+    Deterministically detects a ``list.remove``-style
+    first-occurrence-only filter, or any early-exit mutation: either
+    would leave the second ``"a"`` behind and return ``["a", "b"]``.
+    This test deliberately does NOT claim to catch the ``set(all_keys)``
+    mutation — collapsing the input first and then filtering yields the
+    same ``["b"]`` here, which is precisely why the duplicate-input test
+    above exists as the dedicated detector for that mutant.
+    """
+    # Arrange — mark the duplicated key completed.
+    cp = CheckpointManager(path=tmp_path / "cp.json")
+    cp.mark_completed("games", "a")
+
+    # Act — the completed key appears twice in the input.
+    pending = cp.get_pending("games", ["a", "a", "b"])
+
+    # Assert — the whole ordered list; both copies of "a" are gone.
+    assert pending == ["b"], (
+        "get_pending must filter every duplicate of a completed key, not only its first "
+        f"occurrence; expected ['b'] but got {pending!r}"
+    )
+    assert len(pending) == 1, (
+        "marking 'a' completed must remove BOTH 'a' entries from ['a', 'a', 'b']; got "
+        f"{len(pending)} element(s): {pending!r}"
+    )
+
+
+def test_get_pending_returns_original_element_objects_not_string_coercions(tmp_path: Path) -> None:
+    """``get_pending`` returns the original element objects, not ``str`` copies.
+
+    Hand derivation — nothing is marked completed, so ``completed`` is
+    empty and every element passes the predicate. The comprehension at
+    ``utils/checkpoint.py`` line 548 emits ``k`` itself; ``str(k)`` is
+    evaluated only inside the membership test and its result is
+    discarded. So ``[1, 2]`` comes back as ``[1, 2]`` — genuine ``int``
+    objects — exactly as the method docstring (lines 516-520) promises:
+    "the returned list contains the original elements verbatim".
+
+    Both assertions are required and neither alone suffices. Equality
+    alone catches the blunt ``[str(k) for k in all_keys ...]`` mutation
+    (because ``["1", "2"] != [1, 2]``), but Python's numeric tower makes
+    ``[True, 2] == [1, 2]`` evaluate ``True`` and ``isinstance(True,
+    int)`` is ``True`` as well — only ``type(k) is int`` rules out
+    ``bool`` and NumPy-integer look-alikes.
+    """
+    # Arrange — a fresh manager with nothing marked completed.
+    cp = CheckpointManager(path=tmp_path / "cp.json")
+
+    # Act — non-string keys; get_pending coerces only for the lookup.
+    pending = cp.get_pending("games", [1, 2])
+
+    # Assert — the same values ...
+    assert pending == [1, 2], (
+        "get_pending must return the original elements, not their str() forms "
+        f"(utils/checkpoint.py L548 emits k, never str(k)); expected [1, 2] but got {pending!r}"
+    )
+    # ... and the same concrete types (type identity, deliberately not isinstance).
+    assert all(type(k) is int for k in pending), (
+        "get_pending must preserve each element's exact type; expected every element to be a "
+        f"genuine int but got types {[type(k).__name__ for k in pending]!r} for {pending!r}"
+    )
+
+
+def test_get_pending_preserves_unsorted_input_order_with_middle_key_completed(tmp_path: Path) -> None:
+    """Surviving keys keep INPUT order, which here is deliberately not sorted order.
+
+    Hand derivation — ``mark_completed("games", "0022500002")`` makes
+    ``completed == {"0022500002"}``; the comprehension at
+    ``utils/checkpoint.py`` line 548 walks
+    ``["0022500003", "0022500002", "0022500001", "0022500004"]`` left to
+    right and emits every element whose ``str`` form is absent from
+    ``completed``, so the three survivors appear in input order:
+    ``["0022500003", "0022500001", "0022500004"]``.
+
+    Deterministically detects a ``sorted(...)`` mutation, which would
+    instead yield ``["0022500001", "0022500003", "0022500004"]``. It also
+    catches the ``set(all_keys)`` mutation whenever that mutant's
+    arbitrary iteration order differs from the input order, though the
+    duplicate-input test above is the deterministic detector for that one.
+
+    The pre-existing Phase 2.6 order test supplies an already-sorted
+    ``["a", "b", "c", "d"]``, so its expected ``["a", "c", "d"]`` is
+    indistinguishable from a sorted result; the unsorted input used here
+    is what makes the order guarantee genuinely falsifiable, and it is
+    what protects the pipelines' chronological ``GAME_ID`` fetch order.
+    """
+    # Arrange — mark ONE key sitting in the middle of the input sequence.
+    cp = CheckpointManager(path=tmp_path / "cp.json")
+    cp.mark_completed("games", "0022500002")
+
+    # Act — canonical 10-character GAME_IDs supplied out of sorted order.
+    pending = cp.get_pending(
+        "games",
+        ["0022500003", "0022500002", "0022500001", "0022500004"],
+    )
+
+    # Assert — the whole ordered list, which is NOT the sorted list.
+    assert pending == ["0022500003", "0022500001", "0022500004"], (
+        "get_pending must preserve input order (utils/checkpoint.py L503-506); expected "
+        f"['0022500003', '0022500001', '0022500004'] but got {pending!r}"
+    )
+    assert len(pending) == 3, (
+        "exactly one of the four supplied GAME_IDs was completed, so 3 must remain pending; got "
+        f"{len(pending)} element(s): {pending!r}"
+    )
