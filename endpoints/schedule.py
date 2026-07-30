@@ -299,6 +299,13 @@ def enumerate_game_ids(
         if game_id is None:
             continue
         key = str(game_id)
+        # Normalize to the 10-character zero-padded canonical form this
+        # function's docstring promises. The upstream can send the same
+        # game as int 22500001 and as str "0022500001"; without this the
+        # dedupe below would count them as two games and the Games
+        # pipeline would fetch it twice. Mirrors the .str.zfill(10)
+        # normalization in pipelines/ingest_games.py.
+        key = key.zfill(10)
         if key not in seen:
             seen[key] = None
     ordered_ids: List[str] = list(seen.keys())
