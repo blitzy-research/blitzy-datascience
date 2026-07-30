@@ -1141,93 +1141,69 @@ def fake_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
 # Canonical mini-season fixtures — hand-derived, mutation-sensitive test data
 # ---------------------------------------------------------------------------
 #
-# The five fixtures below supply **INPUT** data only. They deliberately
-# contain no expected-output value and no computed value: every literal is
-# hand-chosen, and every quantity a consuming test asserts is derived by
-# hand *in the consuming module* as an uppercase module-level constant with
-# its arithmetic written alongside. That separation is what makes the
-# "no snapshot assertions" constraint auditable — nothing here was captured
-# from a run of the code under test.
+# The five fixtures below hold **input** data only: every value is a literal,
+# never a value produced by running a pipeline. The expected values a consuming
+# test compares against are derived by hand in that test module, which is what
+# keeps the "no snapshot assertions" contract auditable.
 #
-# The canonical mini-season is three games and four players:
+# Within each artifact the per-game row counts vary rather than repeat, and the
+# box-score distribution differs from the play-by-play one. That variation is
+# what keeps several quantities separable: cumulative write sizes, which only
+# grow, against per-game sizes, which rise and fall; a row-count metric
+# emitting the per-game delta against one emitting the cumulative total; and
+# each artifact's sequence against the other's. Uniform counts would instead
+# make the per-game write sizes a flat but still non-decreasing sequence. The
+# counts, the row order, and the game order are therefore load-bearing — every
+# ordered quantity derived from these fixtures follows from exactly these
+# numbers, and the derivations are recorded in the payload docstrings below.
 #
-#   Game  GAME_ID       box rows  play-by-play rows
-#   G1    0022500001           2                  4
-#   G2    0022500002           3                  1
-#   G3    0022500003           2                  3
-#
-# The per-game row counts are UNEQUAL on purpose, and must stay that way.
-# ``tests/unit/pipelines/test_ingest_games.py`` currently validates the
-# cumulative-concat aggregation in ``pipelines/ingest_games.py`` with a
-# monotonicity check (``w["rows"] >= prev``) and validates the row-count
-# metric with a presence check. Both of those hold true under a mutation
-# that writes only the latest frame instead of the cumulative concat, and
-# under a mutation that emits cumulative row counts instead of per-game
-# counts — because the older fixtures use EQUAL per-game counts, which make
-# the correct and incorrect sequences numerically indistinguishable.
-#
-# With 2/3/2 box rows and 4/1/3 play-by-play rows every cumulative write
-# size is unique (2, 5, 7 and 4, 5, 8) and the per-game metric sequence
-# [2, 4, 3, 1, 2, 3] differs from the cumulative sequence [2, 4, 5, 5, 7, 8]
-# at four of six positions. Do NOT normalize, equalize, round, or reorder
-# these counts, and do not add or remove a row: every downstream expected
-# value is derived from exactly these numbers.
-#
-# All cells are scalar so Rule 4 (flat CSV output) holds for the frames the
-# normalizer builds from them. The sole exception is
-# ``malformed_result_set_payloads``, whose entries exist precisely to trip
-# the normalizer's validation guards.
+# Every cell in the mini-season and mixed-ID fixtures is a scalar, so Rule 4
+# (flat CSV — no nested dicts or lists) holds for every frame the normalizer
+# builds from them. The sole intentional exception is
+# ``malformed_result_set_payloads``, whose entries exist precisely to trip the
+# normalizer's validation guards.
 
 
 @pytest.fixture
 def mini_season_boxscore_payloads() -> Dict[str, Any]:
-    """``boxscoretraditionalv2`` envelopes for the canonical mini-season, keyed by ``GAME_ID``.
+    """``boxscoretraditionalv2`` envelopes for the canonical 3-game mini-season.
 
-    Consumed by ``tests/unit/pipelines/test_ingest_games_aggregation.py``,
-    whose ``RecordingClient`` subclass routes on ``params["GameID"]`` (the
-    form ``endpoints.games.fetch_boxscoretraditionalv2`` sends) and returns
-    the matching envelope. Keys are the three canonical 10-character
-    zero-padded identifiers, in the same order as
-    :pyfixture:`mini_season_game_ids`.
+    Supplies the box-score half of the mini-season for game-ingestion
+    aggregation tests, keyed by ``GAME_ID`` in iteration order —
+    ``"0022500001"``, ``"0022500002"``, ``"0022500003"`` — matching
+    :pyfixture:`mini_season_game_ids` one-for-one.
 
-    Each envelope carries a **single** ``resultSets`` entry named
-    ``"PlayerStats"``. That is deliberate:
-    ``pipelines.ingest_games._select_primary_df`` returns the first frame in
-    iteration order, so a second table would be silently discarded and would
-    only obscure the arithmetic below.
+    **Row distribution is 2 / 3 / 2** (see this section's header comment for
+    why the counts vary). Each envelope carries a single ``resultSets``
+    entry named ``"PlayerStats"`` — the first and therefore primary table
+    ``pipelines.ingest_games._select_primary_df`` selects, so the arithmetic
+    below has one unambiguous source.
 
-    Row distribution — deliberately unequal
-    ---------------------------------------
-    G1 ``0022500001`` → 2 rows, G2 ``0022500002`` → 3 rows,
-    G3 ``0022500003`` → 2 rows. Unequal counts are what let a consuming
-    test tell cumulative concatenation apart from "write only the latest
-    frame" (see the section preamble above). Cumulative ``games.csv`` write
-    sizes are therefore 2 ; 2 + 3 = 5 ; 5 + 2 = 7 → ``[2, 5, 7]``, and row
-    conservation over the combined frame is 2 + 3 + 2 = **7**.
+    Four players across three games, with the per-game points laid out so
+    that two independent hand derivations of the total must agree:
 
-    Hand-derived ``PTS`` arithmetic
-    -------------------------------
-    Per game: G1 30 + 28 = 58 ; G2 25 + 31 + 22 = 78 ; G3 35 + 18 = 53.
-    Column total 58 + 78 + 53 = **189**.
+    ====================  =========  ==========  ======  ======  ======
+    Player                PLAYER_ID  TEAM_ID     G1 PTS  G2 PTS  G3 PTS
+    ====================  =========  ==========  ======  ======  ======
+    Nikola Jokić             203999  1610612743      30      25       —
+    Luka Dončić             1629029  1610612742      28       —      35
+    Jayson Tatum            1628369  1610612738       —      31       —
+    Stephen Curry            201939  1610612744       —      22      18
+    ====================  =========  ==========  ======  ======  ======
 
-    Independent per-player cross-check: Jokić (203999) 30 + 25 = 55 ;
-    Dončić (1629029) 28 + 35 = 63 ; Tatum (1628369) 31 ;
-    Curry (201939) 22 + 18 = 40. Total 55 + 63 + 31 + 40 = **189** —
-    agrees with the column total, so the fixture is internally consistent.
+    Hand-derived arithmetic these rows support:
 
-    Cell types
-    ----------
-    ``GAME_ID`` cells are ``str`` in the canonical 10-character zero-padded
-    form (matching what ``endpoints.schedule.enumerate_game_ids`` emits);
-    ``PLAYER_ID``, ``TEAM_ID``, and ``PTS`` are ``int``. Every cell is
-    scalar — no ``dict``, no ``list``, no ``None`` — so
-    :func:`utils.schema_normalizer.normalize_result_sets` produces a
-    Rule-4-compliant frame with ``int64`` dtypes on the numeric columns.
+    * Cumulative ``games.csv`` write sizes: 2 ; 2+3=5 ; 5+2=7 → ``[2, 5, 7]``
+    * Row-count conservation: 2+3+2 → ``7``
+    * ``PTS`` column sum, by game: G1 30+28=58 ; G2 25+31+22=78 ;
+      G3 35+18=53 ; 58+78+53 → ``189``
+    * ``PTS`` cross-check, by player: Jokić 30+25=55 ; Dončić 28+35=63 ;
+      Tatum 31 ; Curry 22+18=40 ; 55+63+31+40 → ``189`` — agrees
+    * Rows per ``GAME_ID`` in the combined frame: ``[2, 3, 2]``
+    * Distinct games ``3``; distinct players ``4``
 
-    Returns
-    -------
-    dict[str, Any]
-        Mapping of ``GAME_ID`` → complete response envelope.
+    ``GAME_ID`` cells are strings in the canonical 10-character zero-padded
+    form; ``PLAYER_ID``, ``TEAM_ID``, and ``PTS`` are integers.
     """
     return {
         "0022500001": {
@@ -1278,55 +1254,35 @@ def mini_season_boxscore_payloads() -> Dict[str, Any]:
 
 @pytest.fixture
 def mini_season_playbyplay_payloads() -> Dict[str, Any]:
-    """``playbyplayv2`` envelopes for the canonical mini-season, keyed by ``GAME_ID``.
+    """``playbyplayv2`` envelopes for the canonical 3-game mini-season.
 
-    Consumed by ``tests/unit/pipelines/test_ingest_games_aggregation.py``
-    alongside :pyfixture:`mini_season_boxscore_payloads`. The keys are the
-    same three canonical 10-character identifiers, in the same order, so a
-    consuming test can route both endpoints off one
-    ``params["GameID"]`` lookup. Each envelope carries a single
-    ``resultSets`` entry named ``"PlayByPlay"``, for the same
-    ``_select_primary_df`` reason documented on the box-score fixture.
+    Supplies the play-by-play half of the mini-season, alongside
+    :pyfixture:`mini_season_boxscore_payloads`. A games pipeline fetches a
+    box score *and* a play-by-play per game, so both mappings are keyed by
+    the same three ``GAME_ID`` values in the same order.
 
-    The ``parameters`` block mirrors :pyfixture:`sample_playbyplay_payload`
-    (``GameID`` / ``StartPeriod`` / ``EndPeriod``) so the envelope reads like
-    a real ``endpoints.games.fetch_playbyplayv2`` response.
+    The ``parameters`` shape mirrors :pyfixture:`sample_playbyplay_payload`
+    (``GameID`` plus the ``StartPeriod`` / ``EndPeriod`` pair), and the
+    single ``resultSets`` entry is named ``"PlayByPlay"`` — the primary
+    table ``pipelines.ingest_games._select_primary_df`` selects.
 
-    Row distribution — deliberately unequal, and deliberately different
-    from the box-score distribution
-    ------------------------------------------------------------------
-    G1 ``0022500001`` → 4 rows, G2 ``0022500002`` → 1 row,
-    G3 ``0022500003`` → 3 rows. Two properties matter:
+    **Row distribution is 4 / 1 / 3**, different from the box-score
+    2 / 3 / 2 distribution so that the two artifacts' cumulative sequences
+    cannot be confused with one another.
 
-    * The counts are unequal across games, so cumulative
-      ``play_by_play.csv`` write sizes are 4 ; 4 + 1 = 5 ; 5 + 3 = 8 →
-      ``[4, 5, 8]`` — three distinct values that a "write only the latest
-      frame" mutation cannot reproduce. Row conservation over the combined
-      frame is 4 + 1 + 3 = **8**.
-    * The play-by-play count differs from the box-score count *within* every
-      game (4 vs 2, 1 vs 3, 3 vs 2). ``pipelines.ingest_games.run`` emits
-      ``pipeline_rows_written_total`` twice per iteration — once with
-      ``n=len(box_frame)``, then once with ``n=len(pbp_frame)`` — so the
-      interleaved per-game sequence is
-      (2, 4), (3, 1), (2, 3) → ``[2, 4, 3, 1, 2, 3]``. A mutation emitting
-      the cumulative frame length instead would produce
-      ``[2, 4, 5, 5, 7, 8]``, which differs at four of the six positions.
-      Note that G2 inverts the ordering (1 play-by-play row against 3 box
-      rows), so a mutation that swapped the two ``inc`` calls is detectable
-      too.
+    Hand-derived arithmetic these rows support:
 
-    Cell types
-    ----------
-    ``GAME_ID`` is ``str`` in canonical form; ``EVENTNUM`` is ``int``,
-    numbered from 1 within each game; ``EVENTDESC`` is a short plausible
-    ``str`` naming players who actually appear in that game's box score.
-    Every cell is scalar — no ``None``, no nested structure — so Rule 4
-    holds for the normalized frame.
+    * Cumulative ``play_by_play.csv`` write sizes: 4 ; 4+1=5 ; 5+3=8 →
+      ``[4, 5, 8]``
+    * Row-count conservation: 4+1+3 → ``8``
+    * Interleaved with the box-score counts, the ordered
+      ``pipeline_rows_written_total`` increments are (games, pbp) per
+      iteration — (2,4), (3,1), (2,3) → ``[2, 4, 3, 1, 2, 3]``, whereas
+      emitting the cumulative frame length instead of the per-game count
+      would read ``[2, 4, 5, 5, 7, 8]``.
 
-    Returns
-    -------
-    dict[str, Any]
-        Mapping of ``GAME_ID`` → complete response envelope.
+    ``EVENTNUM`` values are integers numbered from 1 within each game;
+    ``EVENTDESC`` values are short scalar strings, and no cell is ``None``.
     """
     return {
         "0022500001": {
@@ -1337,10 +1293,10 @@ def mini_season_playbyplay_payloads() -> Dict[str, Any]:
                     "name": "PlayByPlay",
                     "headers": ["GAME_ID", "EVENTNUM", "EVENTDESC"],
                     "rowSet": [
-                        ["0022500001", 1, "Start of 1st Period"],
-                        ["0022500001", 2, "Jokić 4' Driving Layup (2 PTS)"],
-                        ["0022500001", 3, "Dončić Defensive Rebound"],
-                        ["0022500001", 4, "Dončić 26' 3PT Jump Shot (3 PTS)"],
+                        ["0022500001", 1, "Jump Ball won by Denver"],
+                        ["0022500001", 2, "Jokić 12' Jump Shot (2 PTS)"],
+                        ["0022500001", 3, "Dončić Driving Layup (2 PTS)"],
+                        ["0022500001", 4, "Denver Rebound"],
                     ],
                 }
             ],
@@ -1353,7 +1309,7 @@ def mini_season_playbyplay_payloads() -> Dict[str, Any]:
                     "name": "PlayByPlay",
                     "headers": ["GAME_ID", "EVENTNUM", "EVENTDESC"],
                     "rowSet": [
-                        ["0022500002", 1, "Tatum 24' 3PT Jump Shot (3 PTS)"],
+                        ["0022500002", 1, "Tatum 26' 3PT Jump Shot (3 PTS)"],
                     ],
                 }
             ],
@@ -1366,9 +1322,9 @@ def mini_season_playbyplay_payloads() -> Dict[str, Any]:
                     "name": "PlayByPlay",
                     "headers": ["GAME_ID", "EVENTNUM", "EVENTDESC"],
                     "rowSet": [
-                        ["0022500003", 1, "Start of 1st Period"],
-                        ["0022500003", 2, "Curry 28' 3PT Jump Shot (3 PTS)"],
-                        ["0022500003", 3, "Dončić Turnover (Bad Pass)"],
+                        ["0022500003", 1, "Curry 28' 3PT Jump Shot (3 PTS)"],
+                        ["0022500003", 2, "Dončić Free Throw 1 of 2 (1 PTS)"],
+                        ["0022500003", 3, "SUB: Curry FOR Podziemski"],
                     ],
                 }
             ],
@@ -1378,95 +1334,59 @@ def mini_season_playbyplay_payloads() -> Dict[str, Any]:
 
 @pytest.fixture
 def mini_season_game_ids() -> List[str]:
-    """Ordered canonical ``GAME_ID`` list for the mini-season — the patched enumeration result.
+    """The ordered canonical ``GAME_ID`` list for the mini-season.
 
-    Consumed by ``tests/unit/pipelines/test_ingest_games_aggregation.py`` as
-    the return value of a monkeypatched
-    ``pipelines.ingest_games.enumerate_game_ids``. The patch target must be
-    the *importing* module (``pipelines.ingest_games``), not
-    :mod:`endpoints.schedule`, because ``pipelines/ingest_games.py`` binds
-    the name at module scope — patching the defining module has no effect.
+    Supplies the enumeration input for game-ingestion tests: the three
+    identifiers a games pipeline receives from schedule enumeration, in the
+    order it receives them.
 
-    Order is significant, not incidental
-    ------------------------------------
-    ``pipelines.ingest_games.run`` iterates this sequence verbatim, so the
-    order fixes three observable orderings a consuming test asserts exactly:
-    the writer's cumulative row-count sequence (``[2, 5, 7]`` for
-    ``games.csv`` and ``[4, 5, 8]`` for ``play_by_play.csv``), the
-    ``pipeline_rows_written_total`` increment sequence
-    (``[2, 4, 3, 1, 2, 3]``), and the per-game
-    ``CheckpointManager.mark_completed`` calls, which land as
-    ``[(DOMAIN_GAMES, "0022500001"), (DOMAIN_GAMES, "0022500002"),
-    (DOMAIN_GAMES, "0022500003")]``.
+    **Order is significant, not incidental.** A games pipeline iterates this
+    sequence, appends each game's frame to its buffer in that order,
+    re-writes the cumulative artifact after every game, and records one
+    checkpoint mark per game, so every ordered quantity derived from the
+    mini-season follows from this exact ordering.
 
-    Canonical form
-    --------------
-    Every element is the 10-character zero-padded form that
-    ``endpoints.schedule.enumerate_game_ids`` promises in its docstring and
-    that ``pipelines/ingest_games.py`` mirrors with its
-    ``.astype(str).str.zfill(10)`` resume normalization. The three
-    identifiers correspond one-to-one, and in the same order, with the keys
-    of :pyfixture:`mini_season_boxscore_payloads` and
-    :pyfixture:`mini_season_playbyplay_payloads`, so a ``RecordingClient``
-    routing on ``params["GameID"]`` always finds a seeded envelope.
-
-    Returns
-    -------
-    list[str]
-        The three canonical identifiers, in fixture order.
+    Every element is the canonical 10-character zero-padded form, and the
+    three values correspond one-for-one with the keys of
+    :pyfixture:`mini_season_boxscore_payloads` and
+    :pyfixture:`mini_season_playbyplay_payloads`.
     """
     return ["0022500001", "0022500002", "0022500003"]
 
 
 @pytest.fixture
 def schedule_mixed_game_id_payload() -> Dict[str, Any]:
-    """``leaguegamefinder`` envelope in which one game arrives twice with different wire types.
+    """``leaguegamefinder`` envelope where one game arrives under two wire types.
 
-    Consumed by
-    ``tests/unit/endpoints/test_schedule_game_id_normalization.py``. This is
-    the reproduction envelope for defect **CD-1** — duplicate-record leakage
-    out of ``endpoints.schedule.enumerate_game_ids``.
+    Supplies the mixed-wire-type input for ``GAME_ID`` canonicalization and
+    deduplication tests.
 
-    The shape is realistic, not contrived: the comment above the dedupe loop
-    in ``endpoints/schedule.py`` already records that "the upstream
-    occasionally returns numeric types for IDs that look numeric", and
-    ``leaguegamefinder`` emits one row per team per game, so the same game
-    legitimately appears more than once in a single response.
+    The envelope shape follows :pyfixture:`sample_schedule_payload`
+    (``leaguegamefinder`` resource, ``LeagueGameFinderResults`` table,
+    headers ``SEASON_ID`` / ``TEAM_ID`` / ``GAME_ID`` / ``GAME_DATE``), but
+    the row distribution is **2 + 1**: two rows for one game and a single
+    row for another, three rows describing **two** distinct games in total.
 
-    The failing case, and the exact arithmetic
-    -----------------------------------------
-    Three rows describe **two** distinct games. Rows 1 and 2 are the same
-    game ``0022500001`` — row 1 carries ``GAME_ID`` as the bare Python
-    ``int`` ``22500001`` (eight characters once stringified, prefix zeros
-    stripped by the upstream), row 2 as the ``str`` ``"0022500001"`` (ten
-    characters). Row 3 is a genuinely different game, ``"0022500002"``.
+    1. ``GAME_ID`` as the bare integer ``22500001``
+    2. **the same game**, ``GAME_ID`` as the string ``"0022500001"``
+    3. a distinct control game, ``"0022500002"``
 
-    * Before the CD-1 fix, the dedupe loop keyed on a bare ``str(game_id)``,
-      so ``str(22500001) == "22500001"`` and ``str("0022500001") ==
-      "0022500001"`` hashed differently and the function returned
-      ``['22500001', '0022500001', '0022500002']`` — **three** identifiers
-      for two games. Because ``CheckpointManager.get_pending`` does not
-      deduplicate its own input, the duplicate survived into
-      ``pipelines.ingest_games.run``, which fetched, normalized, and
-      appended that one game twice, so ``games.csv`` gained duplicate rows.
-    * After the fix (one statement zero-padding the key to the canonical
-      width) the function returns ``['0022500001', '0022500002']`` — **two**
-      identifiers, each exactly ten characters.
+    The int-versus-str asymmetry between rows 1 and 2 is the entire point:
+    row 1's cell is a bare Python :class:`int`, with no quotes and no
+    leading zeros. The shape is realistic rather than contrived — the
+    inline commentary in ``endpoints/schedule.py`` records that the upstream
+    occasionally returns numeric types for identifiers that look numeric.
 
-    The int-versus-str asymmetry in rows 1 and 2 is the entire point of this
-    fixture. Do not quote ``22500001``, do not add leading zeros to it, and
-    do not "tidy" it: padding it here would make the consuming assertion
-    pass against the unfixed code and destroy its fault-detection value.
-
-    This is the only fixture in this section whose consuming test depends on
-    the CD-1 source change. If a reviewer concludes the pre-fix behavior was
-    intended policy rather than a defect, that single test is dropped
-    together with the fix; every other fixture here is independent of it.
-
-    Returns
-    -------
-    dict[str, Any]
-        A complete ``leaguegamefinder`` response envelope.
+    The keying arithmetic follows from that asymmetry: ``str(22500001)`` is
+    eight characters while ``str("0022500001")`` is ten, so deduplicating on
+    the unpadded string form keys these three rows as ``['22500001',
+    '0022500001', '0022500002']`` — **three identifiers for two games**,
+    which has a games pipeline fetch and append one game twice and duplicate
+    its rows in ``games.csv``. ``CheckpointManager.get_pending`` cannot
+    absorb such a duplicate, because it is an order-preserving filter that
+    does not deduplicate its input. Keying on the 10-character zero-padded
+    canonical form instead yields ``['0022500001', '0022500002']`` — two
+    identifiers, every element ten characters wide.
     """
     return {
         "resource": "leaguegamefinder",
@@ -1487,102 +1407,80 @@ def schedule_mixed_game_id_payload() -> Dict[str, Any]:
 
 @pytest.fixture
 def malformed_result_set_payloads() -> Dict[str, Any]:
-    """Seven minimal envelopes, each tripping exactly one normalizer validation guard.
+    """Seven payloads targeting selected ``normalize_result_sets`` branches.
 
-    Consumed by
-    ``tests/unit/utils/test_schema_normalizer_malformed_input.py``, which
-    parametrizes over these case names and asserts the exact ``ValueError``
-    message each one produces. Keys are short snake_case case names;
-    values are the smallest envelope that reaches the intended guard.
+    Supplies the malformed-envelope inputs for schema-normalizer validation
+    tests, keyed by case name so the cases can be parametrized and matched
+    against exact :class:`ValueError` message text. The branches sit in
+    ``_extract_tables``, ``_require_str``, ``_require_list``, the
+    non-string-headers check in ``normalize_result_sets``, and the row type
+    and width checks in ``_build_dataframe`` — each reached through the
+    public ``utils.schema_normalizer.normalize_result_sets`` entry point
+    rather than by importing a private helper.
 
-    Why these seven
-    ---------------
-    Together they give the three private helpers in
-    :mod:`utils.schema_normalizer` that currently have **zero** test
-    references anywhere in the suite their first coverage —
-    ``_extract_tables`` (via ``result_sets_supplied_as_string``),
-    ``_require_str`` (via ``missing_name_field``), and ``_require_list``
-    (via ``headers_supplied_as_dict`` and ``rowset_key_absent``) — plus the
-    non-string-headers branch and the row-is-not-a-sequence branch, neither
-    of which the existing 27 normalizer tests exercise (they cover row
-    *length* mismatch only, through :pyfixture:`sample_row_mismatch_payload`).
+    Each envelope is the minimal shape that trips exactly one branch. That
+    requires care about evaluation order inside ``normalize_result_sets``:
+    ``name`` is resolved and snake-cased *before* ``headers`` and ``rowSet``
+    are validated, and the non-string-headers check runs *after* both
+    ``_require_list`` calls. So, for example, the non-string-header envelope
+    must still carry a valid ``name`` and a list-typed ``rowSet``, or it
+    would trip an earlier guard instead. The result-set name is ``"t"``
+    wherever a name is present, because ``_snake_case("t")`` returns
+    ``"t"`` and the message text therefore quotes it verbatim.
 
-    Every case is reached through the public
-    :func:`utils.schema_normalizer.normalize_result_sets` entry point. No
-    consuming test imports a private helper, and no production module is
-    reshaped to make a helper reachable.
+    Case name → the exact message raised:
 
-    Guard order, and why each envelope is shaped the way it is
-    ---------------------------------------------------------
-    ``normalize_result_sets`` validates in a fixed order: ``_extract_tables``
-    on the envelope, then per table ``name`` (resolved and snake-cased
-    first), then ``headers``, then ``rowSet``, then the non-string-headers
-    check, and only then ``_build_dataframe`` (row type before row width).
-    Each envelope below therefore carries valid values for every field that
-    is checked *earlier* than its target guard, so exactly one guard fires
-    and the asserted message is unambiguous. The result-set name is ``"t"``
-    wherever a name is present because ``_snake_case("t")`` returns ``"t"``
-    unchanged, keeping the message text literal.
+    * ``row_width_mismatch`` → ``Result set 't' row 0 has 2 values but 3
+      headers are declared``
+    * ``missing_name`` → ``Result set is missing required string field
+      'name' (got NoneType)``
+    * ``headers_not_list`` → ``Result set field 'headers' must be a list;
+      got dict``
+    * ``missing_row_set`` → ``Result set field 'rowSet' must be a list; got
+      NoneType``
+    * ``non_string_header`` → ``Result set 't' contains non-string headers:
+      ['A', 7]``
+    * ``row_not_sequence`` → ``Result set 't' row 0 is dict, expected
+      list/tuple``
+    * ``result_sets_wrong_type`` → ``'resultSets' must be a list or dict,
+      got str``
 
-    Case name → exact message the consumer asserts
-    ----------------------------------------------
-    * ``row_narrower_than_headers`` →
-      ``Result set 't' row 0 has 2 values but 3 headers are declared``
-    * ``missing_name_field`` →
-      ``Result set is missing required string field 'name' (got NoneType)``
-    * ``headers_supplied_as_dict`` →
-      ``Result set field 'headers' must be a list; got dict``
-    * ``rowset_key_absent`` →
-      ``Result set field 'rowSet' must be a list; got NoneType``
-    * ``non_string_header_element`` →
-      ``Result set 't' contains non-string headers: ['A', 7]``
-    * ``row_supplied_as_dict`` →
-      ``Result set 't' row 0 is dict, expected list/tuple``
-    * ``result_sets_supplied_as_string`` →
-      ``'resultSets' must be a list or dict, got str``
-
-    These envelopes are the one deliberate exception to the scalar-cell
-    convention of this section: ``row_supplied_as_dict`` and
-    ``headers_supplied_as_dict`` embed a ``dict`` on purpose. None of them
-    exercises the Rule 4 nested-*cell* assertion, which is already covered
-    by :pyfixture:`sample_nested_violation_payload` — they are rejected by
-    the structural guards that run before the frame is ever built.
-
-    Returns
-    -------
-    dict[str, Any]
-        Mapping of case name → malformed response envelope.
+    Branches outside this set: a payload with no result sets, a singular
+    ``resultSet`` of the wrong type, a ``name`` present but empty or
+    non-string, a non-dict payload (:class:`TypeError`, not
+    :class:`ValueError`), and Rule 4 nested cells — covered by
+    :pyfixture:`sample_nested_violation_payload`.
     """
     return {
-        "row_narrower_than_headers": {
+        "row_width_mismatch": {
             "resultSets": [
                 {"name": "t", "headers": ["A", "B", "C"], "rowSet": [[1, 2]]}
             ]
         },
-        "missing_name_field": {
+        "missing_name": {
             "resultSets": [
                 {"headers": ["A"], "rowSet": [[1]]}
             ]
         },
-        "headers_supplied_as_dict": {
+        "headers_not_list": {
             "resultSets": [
                 {"name": "t", "headers": {"A": 1}, "rowSet": [[1]]}
             ]
         },
-        "rowset_key_absent": {
+        "missing_row_set": {
             "resultSets": [
                 {"name": "t", "headers": ["A"]}
             ]
         },
-        "non_string_header_element": {
+        "non_string_header": {
             "resultSets": [
                 {"name": "t", "headers": ["A", 7], "rowSet": [[1, 2]]}
             ]
         },
-        "row_supplied_as_dict": {
+        "row_not_sequence": {
             "resultSets": [
                 {"name": "t", "headers": ["A"], "rowSet": [{"A": 1}]}
             ]
         },
-        "result_sets_supplied_as_string": {"resultSets": "not-a-list"},
+        "result_sets_wrong_type": {"resultSets": "not-a-list"},
     }
