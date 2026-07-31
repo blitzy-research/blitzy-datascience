@@ -892,6 +892,23 @@ def test_ready_subcommand_exits_zero_and_echoes_the_body_when_ready(
 #   CPython renders a SECOND stack on stderr that no in-process test can
 #   observe, because ``CliRunner`` intercepts the exception first.
 #
+# * **Measured evidence for the stderr half, recorded here because no
+#   in-process test can reach it.** Running the real module as a child
+#   process — ``run.py teams --season 2025-26`` against a non-routable
+#   ``NBA_API_BASE_URL`` with the log and output directories redirected
+#   into a sandbox — exits ``1`` and produces THREE renders of the same
+#   failure: stdout carries 4 ``Traceback`` headers / 31 ``File "``
+#   frames / 13 distinct absolute paths, the durable log is
+#   BYTE-IDENTICAL to stdout at the same 4 / 31 / 13, and stderr carries
+#   4 / 37 / 14. Those 6 extra stderr frames and the 14th path are the
+#   top-level CPython render that the ``main(argv=None)`` boundary above
+#   would suppress; the in-process assertions below pin the stdout and
+#   durable-log halves only. Both sinks additionally spell out the full
+#   27-parameter outbound ``leaguedashteamstats`` query string. The
+#   demotion is safe for operators because the same run already emits the
+#   actionable structured line ``NBAClient request exhausted retries``,
+#   so triage never depended on the stack.
+#
 # * **When that fix lands, THIS TEST MUST FAIL — that is its purpose.**
 #   Replace the four disclosure assertions below with their redacted
 #   counterparts: ``log_text.count(TRACEBACK_HEADER) == 0``,
@@ -1013,4 +1030,381 @@ def test_failure_handler_publishes_the_whole_traceback_to_console_and_durable_lo
         f"formatted by two handlers at the same level; console carries "
         f"{len(result.stdout)} bytes and the durable log carries "
         f"{len(log_text)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section G — CHARACTERIZATION of the CWE-117 AMPLIFICATION path, end to end.
+#
+# * **This section asserts behaviour that is WRONG, on purpose**, for the
+#   same reason Section F does: AAP §0.4.5 prescribes that a defect whose
+#   fix lies outside the authorised scope be met by "a test documenting
+#   the current behavior with a comment naming the defect."
+#
+# * **The defect, and why it needs a SECOND test.** Two separate
+#   weaknesses compose into one exploitable outcome, and neither existing
+#   test observes the composition:
+#
+#   1. ``utils/schema_normalizer.py::_build_dataframe`` interpolates the
+#      upstream-controlled result-set name into both of its ``ValueError``
+#      templates with a BARE ``{name}`` and no neutralisation, and
+#      ``_snake_case`` re-punctuates the value without stripping control
+#      characters. A newline inside an upstream ``name`` therefore
+#      survives into the exception message. **This half is already
+#      characterised** — at the message level — by
+#      ``test_newline_in_result_set_name_forges_a_second_log_line`` in
+#      ``tests/unit/utils/test_schema_normalizer_malformed_input.py``.
+#   2. Every ``except Exception`` handler in ``run.py`` publishes that
+#      exception through ``log.exception``, and ``utils/logger.py`` sends
+#      the record to BOTH a console ``StreamHandler`` and a durable
+#      ``RotatingFileHandler``. **This half is characterised** by
+#      Section F above.
+#
+#   What NEITHER pins is the composition: driven end to end, the embedded
+#   newline terminates the genuine record early and the remainder is
+#   emitted as a STANDALONE PHYSICAL LOG LINE carrying no
+#   ``config.LOG_FORMAT`` prefix at all — no timestamp, no level, no
+#   ``corr=`` field, no logger name. It is therefore indistinguishable
+#   from a record the logging subsystem itself wrote, in the operator's
+#   console AND in the durable forensic log. That is CWE-117, improper
+#   output neutralization for logs, and a forged audit line is materially
+#   worse than a split message, so it earns its own test at the seam
+#   where it actually becomes reachable.
+#
+# * **Reachability, stated honestly.** Result-set names arrive from the
+#   NBA Stats envelope, not from an end user, and ``session.verify=True``
+#   blocks a MITM rewrite, so this is a hardening gap rather than a
+#   directly attacker-reachable vulnerability. It is characterised
+#   because an untrusted-input-shaped defect that no test names is one
+#   nobody finds later.
+#
+# * **Why it is not fixed here.** AAP §0.8.2 places ALL of ``utils/*.py``
+#   AND ``run.py`` out of scope and states that "no logging statement is
+#   altered anywhere"; §0.10.2 makes the ``endpoints/schedule.py``
+#   ``GAME_ID`` padding fix "the single exception exercised" and states
+#   that "no other source change is permitted". Constraint C2 outranks
+#   the optional fix.
+#
+# * **The minimal fix, for whoever is authorised to apply it.** Render the
+#   name through ``repr`` in both ``_build_dataframe`` templates —
+#   ``f"Result set {name!r} row ..."`` — or escape explicitly with
+#   ``name.replace("\n", "\\n").replace("\r", "\\r")``. The ``repr`` form
+#   is provably compatible with the seven exact messages AAP §0.4.2.3
+#   pins, because every one of those fixtures uses the plain name ``"t"``
+#   and ``repr("t")`` is ``"'t'"`` — the same characters the current
+#   ``'{name}'`` template already emits. Neutralisation therefore
+#   activates only for names that really contain a quote or a control
+#   character. Fixing only ``run.py``'s disclosure would NOT close this:
+#   the newline would still split the message wherever that message is
+#   surfaced.
+#
+# * **When that fix lands, THIS TEST MUST FAIL — that is its purpose.**
+#   Replace the expectations below with the neutralised counterparts:
+#   ``len(str(result.exception).splitlines()) == 1``; the durable log
+#   contains ZERO occurrences of :data:`FORGED_LOG_LINE`; every physical
+#   line of the log carries the :data:`LOG_RECORD_PREFIX_MARKER`; and the
+#   message contains the escaped two-character sequence ``\\n`` rather
+#   than a real line break. Keep the exit-code and counter assertions
+#   green — the failure must still be reported and still be counted.
+# ---------------------------------------------------------------------------
+
+#: An upstream result-set name carrying an embedded newline followed by a
+#: forged audit payload. Chosen so ``utils.schema_normalizer._snake_case``
+#: is the IDENTITY on it: the value is already lower-case and contains no
+#: CamelCase boundary and no letter/digit boundary, so the helper returns
+#: it unchanged and every expectation below follows from the message
+#: template alone rather than from any observed output.
+LOG_INJECTION_TABLE_NAME: str = "legit\nforged_admin_login_success"
+
+#: The exception message the normalizer's row-type guard produces for that
+#: name. DERIVED from the template in
+#: ``utils/schema_normalizer.py::_build_dataframe``::
+#:
+#:     f"Result set '{name}' row {idx} is {type(row).__name__}, "
+#:     f"expected list/tuple"
+#:
+#: substituting ``name`` = :data:`LOG_INJECTION_TABLE_NAME`, ``idx`` = 0
+#: (the payload carries a single row) and ``type(row).__name__`` = ``dict``
+#: (the row is supplied as a mapping, which is what trips that guard).
+EXPECTED_INJECTED_VALUE_ERROR_MESSAGE: str = (
+    "Result set 'legit\nforged_admin_login_success' row 0 is dict, "
+    "expected list/tuple"
+)
+
+#: The message spans exactly TWO physical lines, because the substituted
+#: name contributes exactly one newline and the template contributes none.
+EXPECTED_INJECTED_MESSAGE_LINE_COUNT: int = 2
+
+#: The genuine record's terminal line, truncated at the injected newline.
+#: DERIVED as :mod:`traceback`'s ``"<class>: <message>"`` rendering —
+#: ``"ValueError: "`` — followed by the message text up to that newline,
+#: which is ``"Result set '"`` plus the name's pre-newline part
+#: ``"legit"``.
+EXPECTED_TRUNCATED_GENUINE_LINE: str = "ValueError: Result set 'legit"
+
+#: The forged line: everything after the injected newline. DERIVED as the
+#: name's post-newline part ``"forged_admin_login_success"`` followed by
+#: the template's closing quote and tail. It begins with
+#: attacker-supplied text and carries no formatter prefix whatsoever.
+FORGED_LOG_LINE: str = (
+    "forged_admin_login_success' row 0 is dict, expected list/tuple"
+)
+
+#: Exactly ONE forged line reaches each sink. Derivation: the schedule
+#: handler calls ``log.exception`` once, that renders one stack, and the
+#: stack's single terminal line splits into exactly one genuine remnant
+#: plus one forged line.
+EXPECTED_FORGED_LINE_OCCURRENCES: int = 1
+
+#: The substring every GENUINE record line carries, read off
+#: ``config.LOG_FORMAT`` =
+#: ``"%(asctime)s %(levelname)s corr=%(correlation_id)s %(name)s
+#: %(message)s"``. Its ABSENCE from a physical line is what makes that
+#: line forgeable: an operator, and any log shipper doing line-oriented
+#: parsing, has nothing left to distinguish it from real output. A
+#: leading space is included so the marker cannot match inside a message
+#: body that merely mentions ``corr=``.
+LOG_RECORD_PREFIX_MARKER: str = " corr="
+
+#: The subcommand driven end to end, and its metric ``pipeline`` label.
+#: ``schedule`` is chosen because ``pipelines.ingest_schedule.run`` calls
+#: ``normalize_result_sets`` directly on the fetched envelope — the
+#: shortest real path from a malformed upstream payload to ``run.py``'s
+#: failure handler, with no per-game Rule 6 wrapper in between.
+INJECTION_SUBCOMMAND: str = "schedule"
+INJECTION_PIPELINE_LABEL: str = "ingest_schedule"
+
+#: The malformed envelope. A single result set whose NAME carries the
+#: injected newline and whose single row is a ``dict``, so
+#: ``_build_dataframe``'s row-type guard raises before any DataFrame is
+#: built. ``headers`` is a well-formed one-element list precisely so that
+#: no EARLIER guard fires: the test must reach the template that
+#: interpolates the name.
+LOG_INJECTION_PAYLOAD: Dict[str, Any] = {
+    "resultSets": [
+        {
+            "name": LOG_INJECTION_TABLE_NAME,
+            "headers": ["A"],
+            "rowSet": [{"A": 1}],
+        }
+    ]
+}
+
+
+def _install_recorders_except(
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: List[str],
+    keep_real: str,
+) -> None:
+    """Install recording spies on every pipeline EXCEPT ``keep_real``.
+
+    The sibling :func:`_install_recorders` replaces all five, which is right
+    for a pure dispatch test. This variant exists for the end-to-end
+    characterization below, which needs ONE production pipeline to actually
+    execute while still keeping the other four unreachable: a cross-wiring
+    mutation then lands on a spy instead of on a pipeline that would try to
+    reach the NBA Stats API, so the test stays network-free either way.
+
+    ``keep_real`` is looked up against :data:`PIPELINE_MODULES` so a typo
+    cannot silently leave every pipeline spied (which would make the
+    end-to-end assertions unreachable) or every pipeline live.
+    """
+    assert keep_real in PIPELINE_MODULES, (
+        f"keep_real must name one of {sorted(PIPELINE_MODULES)}; "
+        f"got {keep_real!r}"
+    )
+    for domain, module in PIPELINE_MODULES.items():
+        if domain == keep_real:
+            continue
+        monkeypatch.setattr(module, "run", _make_recorder(recorder, domain))
+
+
+def _make_malformed_schedule_fetch(
+    payload: Dict[str, Any],
+) -> Callable[..., Dict[str, Any]]:
+    """Return a stand-in for ``endpoints.schedule.fetch_leaguegamefinder``.
+
+    Patched onto the ``pipelines.ingest_schedule`` module object, which is
+    where the production name is bound: that module does ``from
+    endpoints.schedule import fetch_leaguegamefinder`` at import time, so
+    patching ``endpoints.schedule`` instead would silently no-op.
+
+    Replacing the FETCH rather than the pipeline is what makes this an
+    end-to-end characterization: ``ingest_schedule.run``, the real
+    ``normalize_result_sets`` validation gate, the real ``ValueError`` it
+    raises and the real ``run.py`` failure handler all stay in the loop.
+    Only the HTTP round trip is removed, so no test performs network I/O.
+
+    The signature mirrors the real helper's ``(client, season)`` exactly,
+    with no catch-all ``**kwargs``, so a change to how the pipeline calls
+    it raises ``TypeError`` inside ``run.py``'s ``try`` instead of being
+    absorbed silently.
+    """
+
+    def _fetch_leaguegamefinder(client: Any, season: str) -> Dict[str, Any]:
+        return payload
+
+    return _fetch_leaguegamefinder
+
+
+def test_malformed_table_name_forges_an_unprefixed_line_in_both_sinks(
+    cli_runner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+) -> None:
+    """CHARACTERIZATION — an injected newline forges a whole audit line.
+
+    Drives a result-set name containing ``"\\nforged_admin_login_success"``
+    through the REAL ``pipelines.ingest_schedule.run``, the REAL
+    ``utils.schema_normalizer`` validation gate and the REAL ``run.py``
+    ``schedule`` failure handler, then reads the durable log back
+    line-by-line. Pins that the payload's post-newline remainder becomes a
+    STANDALONE physical line carrying none of ``config.LOG_FORMAT``'s
+    fields, in the durable log and mirrored on the console — the composed
+    outcome that neither the message-level normalizer characterization nor
+    Section F's dual-sink characterization observes on its own.
+
+    Mutations detected:
+
+    * Applying the ``repr``/escaping fix to either ``_build_dataframe``
+      template — the message collapses to one line, the forged line
+      disappears, and the log's final line becomes a prefixed record. Four
+      assertions turn red and route the fixer to this section's banner.
+    * Applying the ``run.py`` redaction fix ALONE — the traceback stops
+      being published, so the forged line disappears from both sinks while
+      the two-line exception message survives. The split assertions stay
+      green and the sink assertions turn red, which is exactly the signal
+      that the disclosure was closed but the neutralisation gap was not.
+    * Making ``_snake_case`` strip or replace control characters — the same
+      collapse as the ``repr`` fix, detected the same way.
+    * Dropping the result-set name from either template — the forged text
+      disappears and the diagnostic that names the offending table is
+      lost.
+    * Swallowing the exception in ``run.py``'s handler instead of
+      re-raising — the exit-code and error-counter assertions turn red.
+    """
+    # Arrange — census spies on the other four pipelines so a mis-dispatch
+    # lands on a spy rather than on a production pipeline that would try
+    # to reach the NBA Stats API; the schedule pipeline stays REAL and
+    # only its fetch is starved of the network.
+    recorder: List[str] = []
+    _install_recorders_except(monkeypatch, recorder, INJECTION_SUBCOMMAND)
+    monkeypatch.setattr(
+        ingest_schedule,
+        "fetch_leaguegamefinder",
+        _make_malformed_schedule_fetch(LOG_INJECTION_PAYLOAD),
+    )
+
+    # Act
+    result = cli_runner.invoke(
+        cli, [INJECTION_SUBCOMMAND, "--season", config.DEFAULT_SEASON]
+    )
+
+    # Assert — the real validation gate raised, and the real handler ran.
+    assert result.exit_code == EXIT_FAILURE, (
+        f"`cli {INJECTION_SUBCOMMAND}` must exit {EXIT_FAILURE} when the "
+        f"normalizer rejects the envelope; got {result.exit_code}. "
+        f"stderr={result.stderr!r}"
+    )
+    assert type(result.exception) is ValueError, (
+        f"the propagated exception must be the normalizer's own "
+        f"ValueError, so this test characterises the production message "
+        f"template rather than an injected stand-in; got "
+        f"{type(result.exception).__name__}: {result.exception}"
+    )
+    assert recorder == [], (
+        f"`cli {INJECTION_SUBCOMMAND}` must dispatch to the schedule "
+        f"pipeline and to nothing else; the spies on the other four "
+        f"recorded {recorder!r}, which means the CLI cross-wired a "
+        f"subcommand to the wrong pipeline"
+    )
+
+    # Assert — the message is exactly the template's output, and the
+    # injected newline really did survive into it.
+    assert str(result.exception) == EXPECTED_INJECTED_VALUE_ERROR_MESSAGE, (
+        f"the message must match the _build_dataframe row-type template "
+        f"with the name substituted verbatim; expected "
+        f"{EXPECTED_INJECTED_VALUE_ERROR_MESSAGE!r}, got "
+        f"{str(result.exception)!r}"
+    )
+    message_lines = str(result.exception).splitlines()
+    assert len(message_lines) == EXPECTED_INJECTED_MESSAGE_LINE_COUNT, (
+        f"CHARACTERIZATION drift: the unneutralised name splits the "
+        f"message across exactly {EXPECTED_INJECTED_MESSAGE_LINE_COUNT} "
+        f"physical lines; got {len(message_lines)}. If this reads 1, the "
+        f"repr()/escaping fix has landed and this section's assertions "
+        f"must be replaced with the neutralised counterparts"
+    )
+
+    # Assert — the forged line reaches the DURABLE log as a standalone
+    # physical line, exactly once.
+    log_lines = (tmp_log_dir / "pipeline.log").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    assert log_lines.count(FORGED_LOG_LINE) == EXPECTED_FORGED_LINE_OCCURRENCES, (
+        f"CHARACTERIZATION drift: the durable log holds "
+        f"{log_lines.count(FORGED_LOG_LINE)} standalone forged line(s); "
+        f"this defect currently produces exactly "
+        f"{EXPECTED_FORGED_LINE_OCCURRENCES}. Expected line: "
+        f"{FORGED_LOG_LINE!r}"
+    )
+
+    # Assert — the split point, from both sides: the genuine record is
+    # truncated mid-message and the forged remainder is the final line.
+    # Asserting the pair is what proves ONE record became TWO lines rather
+    # than the forged text merely appearing somewhere.
+    assert log_lines[-2:] == [
+        EXPECTED_TRUNCATED_GENUINE_LINE,
+        FORGED_LOG_LINE,
+    ], (
+        f"the durable log must end with the truncated genuine line "
+        f"followed by the forged one; expected "
+        f"{[EXPECTED_TRUNCATED_GENUINE_LINE, FORGED_LOG_LINE]!r}, got "
+        f"{log_lines[-2:]!r}"
+    )
+
+    # Assert — and the forged line carries NO formatter prefix, which is
+    # the whole substance of CWE-117 here: nothing on that line marks it
+    # as machine-generated.
+    assert LOG_RECORD_PREFIX_MARKER not in log_lines[-1], (
+        f"CHARACTERIZATION drift: the forged line now carries the record "
+        f"prefix marker {LOG_RECORD_PREFIX_MARKER!r}, so it is no longer "
+        f"indistinguishable from attacker-authored content. Line: "
+        f"{log_lines[-1]!r}"
+    )
+
+    # Assert — and the console sink is forged identically, so redacting
+    # only one sink would leave the audit trail compromised.
+    stdout_lines = result.stdout.splitlines()
+    assert (
+        stdout_lines.count(FORGED_LOG_LINE) == EXPECTED_FORGED_LINE_OCCURRENCES
+    ), (
+        f"CHARACTERIZATION drift: the console holds "
+        f"{stdout_lines.count(FORGED_LOG_LINE)} standalone forged "
+        f"line(s); one LogRecord is formatted by two handlers at the same "
+        f"level, so the console must carry exactly "
+        f"{EXPECTED_FORGED_LINE_OCCURRENCES}"
+    )
+
+    # Assert — the failure was still counted under the real label set, so
+    # the forgery happened on the genuine failure path and not on some
+    # short-circuit that never reached the handler.
+    assert (
+        _runs_counter(INJECTION_PIPELINE_LABEL, OUTCOME_ERROR)
+        == EXPECTED_COUNTER_HIT
+    ), (
+        f"{RUNS_COUNTER}{{pipeline={INJECTION_PIPELINE_LABEL!r}, "
+        f"outcome={OUTCOME_ERROR!r}}} must be exactly "
+        f"{EXPECTED_COUNTER_HIT}; got "
+        f"{_runs_counter(INJECTION_PIPELINE_LABEL, OUTCOME_ERROR)}"
+    )
+    assert (
+        _runs_counter(INJECTION_PIPELINE_LABEL, OUTCOME_SUCCESS)
+        == EXPECTED_COUNTER_MISS
+    ), (
+        f"{RUNS_COUNTER}{{pipeline={INJECTION_PIPELINE_LABEL!r}, "
+        f"outcome={OUTCOME_SUCCESS!r}}} must remain "
+        f"{EXPECTED_COUNTER_MISS} on the failure path; got "
+        f"{_runs_counter(INJECTION_PIPELINE_LABEL, OUTCOME_SUCCESS)}"
     )

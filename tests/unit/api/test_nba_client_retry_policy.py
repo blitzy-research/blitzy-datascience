@@ -60,10 +60,24 @@ provide: the ``client`` fixture depends on ``tmp_log_dir`` so ``config.LOG_FILE`
 is already redirected into ``tmp_path`` when the first ``get_logger`` call
 configures logging. Fabricated 500s and 404s therefore leave no trace in the
 operator's ``logs/pipeline.log`` and cause none of its rotation.
+
+That sink isolation is enforced from two independent directions rather than
+merely intended. ``test_retry_logging_is_confined_to_the_temporary_log_file``
+proves it *by inspection* -- it reads ``config.LOG_FILE``, enumerates every
+attached ``FileHandler`` destination, and compares the temporary file's complete
+ordered record list. ``test_retry_flow_leaves_the_repository_operator_log_
+byte_identical`` proves it *at the filesystem level*, comparing the existence,
+byte length and sha256 of ``<repository root>/logs/pipeline.log`` across a fully
+exhausted retry flow. The second check catches a durable write that reaches the
+operator's log by any route the first cannot observe -- a handler on a child
+logger, a handler installed after the enumeration, or a direct ``open()`` -- and
+its companion record-count assertion keeps it from passing vacuously when
+nothing was logged at all.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -157,10 +171,48 @@ EXPECTED_EXC_CLASS = "HTTPError"
 TMP_LOG_DIR_NAME = "logs"
 TMP_LOG_FILE_NAME = "pipeline.log"
 
+# The operator's own durable log, relative to the repository root. Derived from
+# ``config.py``'s shipped defaults rather than read back from ``config`` at test
+# time: ``LOG_DIR`` defaults to ``<root>/logs`` and ``LOG_FILE`` to
+# ``LOG_DIR / "pipeline.log"``. Naming the components literally is what makes
+# the integrity check below meaningful -- reading ``config.LOG_FILE`` instead
+# would resolve to the *redirected* temporary path and the assertion would
+# compare the sandbox against itself and pass vacuously.
+OPERATOR_LOG_DIR_NAME = "logs"
+OPERATOR_LOG_FILE_NAME = "pipeline.log"
+
+# The total number of durable records one exhausted request emits, derived from
+# the two production writers rather than counted from output:
+# ``_retry_log_before_sleep`` fires after every failed attempt EXCEPT the last
+# (``config.RETRY_ATTEMPTS - 1`` WARNINGs) and ``NBAClient.get``'s
+# ``except RequestException`` block adds exactly ONE exhaustion ERROR, so
+# ``(RETRY_ATTEMPTS - 1) + 1 == RETRY_ATTEMPTS``.
+EXPECTED_EXHAUSTION_RECORD_COUNT = config.RETRY_ATTEMPTS
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _log_fingerprint(path: Path) -> Tuple[bool, int, str]:
+    """Return ``(exists, byte_length, sha256_hex)`` for ``path``.
+
+    A three-part fingerprint rather than a bare size, so the comparison
+    catches an in-place rewrite that happens to preserve the length, and a
+    rotation that recreates the file at its original size. The ``exists``
+    flag makes the "file legitimately absent in a fresh clone" case a
+    first-class outcome instead of an exception: an absent log must stay
+    absent, which is just as much an isolation property as an unchanged one.
+
+    ``sha256`` of the empty byte string is used as the digest placeholder for a
+    missing file, which is unambiguous because the ``exists`` flag is compared
+    alongside it.
+    """
+    if not path.exists():
+        return (False, 0, hashlib.sha256(b"").hexdigest())
+    payload = path.read_bytes()
+    return (True, len(payload), hashlib.sha256(payload).hexdigest())
 
 
 def _make_response(
@@ -804,4 +856,102 @@ def test_retry_logging_is_confined_to_the_temporary_log_file(
         f"exhaustion ERROR, with the exact field names and values of the "
         f"production format strings; expected {expected_records!r}, got "
         f"{observed_records!r}"
+    )
+
+
+def test_retry_flow_leaves_the_repository_operator_log_byte_identical(
+    client: NBAClient,
+    fast_tenacity_sleep: None,
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    tmp_path: Path,
+) -> None:
+    """A fully exhausted retry flow does not touch ``<root>/logs/pipeline.log``.
+
+    The sibling test above proves confinement *by inspection* -- it reads
+    ``config.LOG_FILE`` and enumerates the attached ``FileHandler``
+    destinations. This test proves the same property *at the filesystem
+    level and end to end*, which is strictly independent: it would catch a
+    durable write reaching the operator's log through any path that does not
+    appear as a root-logger ``FileHandler`` -- a handler attached to a child
+    logger, a handler installed after the enumeration, or a direct ``open()``
+    in a future code path -- none of which handler inspection can see.
+
+    Why this matters operationally: ``logs/pipeline.log`` is the durable
+    forensic artifact an operator reads after a failed ingestion run. Every
+    failure driven by this module is *fabricated*, so a record of it landing
+    there is a false incident in a real audit trail, and the bytes it adds
+    drive avoidable rotation of genuine history.
+
+    An absent log is an equally valid starting state (a fresh clone has never
+    run the pipeline), so :func:`_log_fingerprint` compares existence as well
+    as size and digest: absent must stay absent, present must stay identical.
+
+    Assertion (3) is what keeps this test honest rather than vacuous. "The
+    operator log did not change" is trivially true if nothing was logged at
+    all, so the temporary sink is required to hold the complete expected
+    record count -- proving durable records really were emitted during the
+    window in which the operator log was being watched.
+
+    Mutations detected:
+
+    * Dropping ``tmp_log_dir`` from the ``client`` fixture -- ``config.LOG_FILE``
+      reverts to the operator path, the exhaustion records land there, and
+      assertions (1) and (2) both turn red on a size and digest change.
+    * Re-pointing ``tmp_log_dir`` at the repository ``logs`` directory instead
+      of ``tmp_path`` -- assertion (0) reports the collision directly.
+    * Suppressing either production writer (the module-level
+      ``_retry_log_before_sleep`` callback or ``get``'s exhaustion ERROR) --
+      assertion (3) reports the shortfall against
+      :data:`EXPECTED_EXHAUSTION_RECORD_COUNT`.
+    """
+    # Arrange -- the operator's own log, addressed by literal path components
+    # so this never resolves to the redirected sandbox (see the constants).
+    operator_log = project_root / OPERATOR_LOG_DIR_NAME / OPERATOR_LOG_FILE_NAME
+    fingerprint_before = _log_fingerprint(operator_log)
+    tmp_log_file = tmp_path / TMP_LOG_DIR_NAME / TMP_LOG_FILE_NAME
+    mock_get = MagicMock(return_value=_make_response(STATUS_SERVER_ERROR))
+    monkeypatch.setattr(client._session, "get", mock_get)
+
+    # Act -- spend the whole retry budget so both durable writers run.
+    with pytest.raises(HTTPError):
+        client.get(ENDPOINT, {})
+
+    fingerprint_after = _log_fingerprint(operator_log)
+
+    # Assert (0) -- the two paths are genuinely distinct, so a pass cannot be
+    # an artefact of the sandbox and the operator log being the same file.
+    assert tmp_log_file != operator_log, (
+        f"the redirected sink and the operator log must be different files for "
+        f"this test to mean anything; both resolved to {operator_log}"
+    )
+
+    # Assert (1) -- the retry budget really was spent, so the window watched
+    # above covers a fully exercised failure rather than a short one.
+    assert mock_get.call_count == config.RETRY_ATTEMPTS, (
+        f"this test only observes the complete durable-write window when every "
+        f"attempt is spent: expected config.RETRY_ATTEMPTS="
+        f"{config.RETRY_ATTEMPTS} attempts, got {mock_get.call_count}"
+    )
+
+    # Assert (2) -- and the operator's durable log is untouched: same existence,
+    # same byte length, same sha256.
+    assert fingerprint_after == fingerprint_before, (
+        f"synthetic retry failures must never reach the operator's durable log "
+        f"{operator_log}; (exists, bytes, sha256) went from "
+        f"{fingerprint_before!r} to {fingerprint_after!r}. A non-zero byte "
+        f"delta means fabricated WARNING/ERROR incidents were appended to a "
+        f"real forensic artefact"
+    )
+
+    # Assert (3) -- non-vacuity: the records exist, they just went to tmp_path.
+    observed_record_count = len(
+        _nba_client_log_records(tmp_log_file.read_text(encoding="utf-8"))
+    )
+    assert observed_record_count == EXPECTED_EXHAUSTION_RECORD_COUNT, (
+        f"the temporary sink must hold all "
+        f"{EXPECTED_EXHAUSTION_RECORD_COUNT} durable records "
+        f"(config.RETRY_ATTEMPTS - 1 retry WARNINGs plus one exhaustion "
+        f"ERROR); got {observed_record_count}. Without them assertion (2) "
+        f"would pass simply because nothing was logged anywhere"
     )
