@@ -44,6 +44,17 @@ Operational-rule posture of this file
   invocation in a per-subcommand ``try/except`` that *logs and
   re-raises* (AAP §0.5.2.1) so Click prints a non-zero exit status;
   it never silently swallows exceptions.
+* **Failure-output confidentiality.** The log half of that
+  "log and re-raise" is deliberately **redacted**: every ``except``
+  block calls :func:`_log_failed_run`, which emits the exception's
+  *class name* on the normal ERROR channels and routes the message and
+  traceback to the DEBUG-gated diagnostic channel. Exception text is
+  arbitrary, frequently upstream-controlled data (URLs with query
+  strings, filesystem paths, payload cell values) and tracebacks
+  publish absolute source paths and line numbers, so neither belongs in
+  the console/CI stream or the durable rotating log by default
+  (CWE-209, CWE-532). See :func:`_log_failed_run` for the full
+  rationale and for what is intentionally *not* changed.
 
 References
 ----------
@@ -172,6 +183,111 @@ def _build_collaborators(
 
 
 # ---------------------------------------------------------------------------
+# Sanitized failure-logging boundary
+# ---------------------------------------------------------------------------
+
+
+def _log_failed_run(
+    log: logging.LoggerAdapter,
+    subcommand: str,
+    season: str,
+) -> None:
+    """Record a run failure WITHOUT disclosing the exception's detail.
+
+    Called from the ``except Exception`` block of every data subcommand
+    and of ``all``, immediately before the mandatory bare ``raise``. It
+    must be invoked while an exception is being handled, because it reads
+    the active exception from :func:`sys.exc_info`.
+
+    Why this exists instead of ``log.exception``
+    -------------------------------------------
+    ``log.exception`` is ``log.error(..., exc_info=True)``, and
+    :func:`utils.logger._configure` attaches BOTH a
+    :class:`logging.StreamHandler` bound to ``sys.stdout`` AND a
+    :class:`logging.handlers.RotatingFileHandler` writing
+    :data:`config.LOG_FILE`, each at :data:`config.LOG_LEVEL`. Using it
+    here therefore rendered the formatted traceback into **two normal
+    operator channels at once** — the interactive/CI console and the
+    durable log file — and with it:
+
+    * the exception's ``str()``, which is arbitrary text this process does
+      not control. An upstream HTTP error carries the request URL and its
+      query string; an :exc:`OSError` carries a filesystem path; a pandas
+      or normalizer error can carry cell values drawn straight from the
+      payload. Any of those may hold a token, a signed URL, or data an
+      operator's log pipeline is not entitled to retain.
+    * ``Traceback (most recent call last)`` with one ``File "<absolute
+      path>", line <n>, in <function>`` frame per stack level, which
+      publishes the deployment's directory layout and exact source
+      coordinates to anyone who can read the log.
+
+    That is CWE-209 (information exposure through an error message) and
+    CWE-532 (insertion of sensitive information into a log file).
+
+    What is emitted instead
+    -----------------------
+    * At **ERROR**, on the normal channels: the ``run.failed`` event, the
+      subcommand, the season, and the exception's **class name**. The
+      class name is a static identifier from this project's own source —
+      never attacker- or data-controlled — and it is what makes the
+      redacted record triage-able (``ConnectionError`` and
+      ``PermissionError`` demand very different operator responses).
+      ``detail=suppressed`` states plainly that more exists, so the record
+      cannot be mistaken for the whole story.
+    * At **DEBUG**, on the protected diagnostic channel: the full
+      ``exc_info`` traceback. :data:`config.LOG_LEVEL` defaults to
+      ``"INFO"`` and both handlers are level-filtered, so this record is
+      discarded — never formatted, never written — unless an operator
+      deliberately opts in with ``NBA_LOG_LEVEL=DEBUG``. Internal
+      causality is preserved and gated, not destroyed.
+
+    What is deliberately unchanged
+    ------------------------------
+    The caller's bare ``raise`` and the ``metrics.registry.inc`` call that
+    precedes it. AAP §0.5.2.1 mandates that this boundary *log and
+    re-raise*: the original exception object — traceback, ``__cause__``
+    and attributes intact — must still reach the caller so Click exits
+    non-zero and no failure is ever silently swallowed. Redaction applies
+    to what this process *writes to its own log sinks*, not to what it
+    propagates.
+
+    Parameters
+    ----------
+    log : logging.LoggerAdapter
+        The subcommand-scoped adapter returned by
+        :func:`_build_collaborators`; it carries the correlation ID that
+        ties this record to the rest of the run, which is how an operator
+        finds the matching DEBUG detail after re-running with
+        ``NBA_LOG_LEVEL=DEBUG``.
+    subcommand : str
+        The Click subcommand name (``"players"``, ``"all"``, ...).
+    season : str
+        The ``--season`` value, echoed for symmetry with the
+        ``run.start`` record. It is a CLI argument, not payload data.
+    """
+    # ``sys.exc_info()[1]`` rather than an ``except ... as exc`` binding:
+    # it keeps each call site a single statement and reads the exception
+    # the interpreter is currently handling, which is exactly the one the
+    # DEBUG record's ``exc_info=True`` will render.
+    active = sys.exc_info()[1]
+    error_type = type(active).__name__ if active is not None else "unknown"
+
+    log.error(
+        "run.failed subcommand=%s season=%s error_type=%s detail=suppressed "
+        "(re-run with NBA_LOG_LEVEL=DEBUG for the traceback)",
+        subcommand,
+        season,
+        error_type,
+    )
+    log.debug(
+        "run.failed.detail subcommand=%s season=%s",
+        subcommand,
+        season,
+        exc_info=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Click group
 # ---------------------------------------------------------------------------
 
@@ -215,8 +331,10 @@ def cli(ctx: click.Context) -> None:
 #      emit "run.complete" INFO.
 #   5. On failure: increment
 #      pipeline_runs_total{pipeline=ingest_<domain>,outcome=error},
-#      emit "run.failed" ERROR with exception info, and re-raise so
-#      Click exits with a non-zero status.
+#      emit a REDACTED "run.failed" ERROR via _log_failed_run (exception
+#      class name only — never its message or traceback, which go to the
+#      DEBUG-gated diagnostic channel), and re-raise so Click exits with
+#      a non-zero status.
 #
 # The ``pipeline`` / ``outcome`` labels with values ``ingest_<domain>`` /
 # ``success|error`` are the binding contract documented in
@@ -261,7 +379,7 @@ def players(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_players", "outcome": "error"},
         )
-        log.exception("run.failed subcommand=players season=%s", season)
+        _log_failed_run(log, "players", season)
         raise
 
 
@@ -293,7 +411,7 @@ def teams(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_teams", "outcome": "error"},
         )
-        log.exception("run.failed subcommand=teams season=%s", season)
+        _log_failed_run(log, "teams", season)
         raise
 
 
@@ -334,7 +452,7 @@ def games(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_games", "outcome": "error"},
         )
-        log.exception("run.failed subcommand=games season=%s", season)
+        _log_failed_run(log, "games", season)
         raise
 
 
@@ -366,7 +484,7 @@ def lineups(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_lineups", "outcome": "error"},
         )
-        log.exception("run.failed subcommand=lineups season=%s", season)
+        _log_failed_run(log, "lineups", season)
         raise
 
 
@@ -398,7 +516,7 @@ def schedule(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_schedule", "outcome": "error"},
         )
-        log.exception("run.failed subcommand=schedule season=%s", season)
+        _log_failed_run(log, "schedule", season)
         raise
 
 
@@ -454,7 +572,7 @@ def all_cmd(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "all", "outcome": "error"},
         )
-        log.exception("run.failed subcommand=all season=%s", season)
+        _log_failed_run(log, "all", season)
         raise
 
 

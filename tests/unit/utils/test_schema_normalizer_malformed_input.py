@@ -7,41 +7,13 @@ dtype-inference behaviour of the single
 ``pd.DataFrame(row_set, columns=headers)`` construction site
 (``utils/schema_normalizer.py`` line 331).
 
-Why this module exists — the verified gap
------------------------------------------
-The identifiers below were counted across the whole ``tests/`` tree
-before this module was written:
-
-* ``_extract_tables`` — **0** references anywhere in ``tests/``.
-* ``_require_str`` — **0** references anywhere in ``tests/``.
-* ``_require_list`` — **0** references anywhere in ``tests/``.
-
-And inside the sibling module ``test_schema_normalizer.py``
-(596 lines / 27 tests):
-
-* ``dtype``, ``int64``, ``float64``, ``isna``, ``nan``, ``to_numeric``
-  — **0** hits each. Repository-wide, ``dtypes[`` has **0** hits
-  anywhere in ``tests/``.
-
-No test in this repository asserted a dtype before this module. Three
-private validation helpers had never been exercised by anything, so
-deleting any one of their ``raise`` statements would not have failed a
-single test. The objective here is therefore **fault detection
-(mutation resistance)**, not a coverage percentage: this project ships
-no coverage instrument by design (``pytest-cov`` and ``coverage`` are
-absent and forbidden by the ``tests/conftest.py`` do-not list), so no
-percentage is claimed anywhere.
-
-Test-file contract highlights
------------------------------
+Contracts pinned here
+---------------------
 * **Private helpers are reached ONLY through the public entry point.**
-  ``_extract_tables``, ``_require_str``, and ``_require_list`` receive
-  their first-ever coverage here, exclusively by feeding malformed
-  envelopes to the public ``normalize_result_sets``. No private helper
-  is imported, promoted, or given a test-only hook, so no production
-  source file changes. Contrast the sibling module, which aliases the
-  module as ``sn_module`` to reach ``_snake_case`` directly — that
-  pattern is deliberately NOT copied here.
+  ``_extract_tables``, ``_require_str``, and ``_require_list`` are
+  exercised exclusively by feeding malformed envelopes to the public
+  ``normalize_result_sets``. No private helper is imported, promoted, or
+  given a test-only hook, so no production source file changes.
 * **Seven rejection branches, seven exact messages.** Each envelope in
   the shared ``malformed_result_set_payloads`` fixture is the minimal
   shape that trips exactly one guard, and each expected message is the
@@ -50,9 +22,10 @@ Test-file contract highlights
   performs a :func:`re.search`, every pattern is wrapped in
   :func:`re.escape` — the messages contain ``'``, ``[``, ``]``, ``(``,
   and ``)``, any of which would silently alter an unescaped pattern and
-  make the assertion pass for the wrong reason. Two cases additionally
-  assert full-string ``==`` equality, which is strictly stronger than a
-  containment match.
+  make the assertion pass for the wrong reason. Every case additionally
+  asserts full-string ``==`` equality alongside the containment match,
+  and the row-width branch carries a dedicated boundary test that does
+  the same — both strictly stronger than a containment search.
 * **The dtype and null contract is pinned exactly.** An integer column
   containing ``None`` upcasts to ``float64`` with ``NaN``, while an
   object column preserves ``None`` as the literal ``None`` — yet
@@ -64,12 +37,57 @@ Test-file contract highlights
   supplied as the string ``"31"`` therefore stays an ``object``-dtype
   ``str``. The normalizer's job is faithful structural translation, and
   that is asserted rather than assumed.
-* **Duplicate names are uniquified, never overwritten.** Only the
-  genuinely new *collision* case is covered here: an upstream name that
-  already ends in a digit (``PlayByPlay2``) colliding with the
-  suffixing scheme applied to a repeated ``PlayByPlay``. The simple
-  ``["x", "x_2", "x_3"]`` case is already covered by the sibling module
-  and is deliberately not duplicated.
+* **Duplicate names are uniquified, never overwritten.** Two strictly
+  different cases are covered here, and confusing them is precisely what
+  let a real defect (CD-2, below) survive: the **near miss**, where an
+  upstream name already ends in a digit (``PlayByPlay2`` ->
+  ``play_by_play2``) and merely resembles the generated
+  ``play_by_play_2`` without ever occupying it; and the **true
+  collision**, where an upstream name snake-cases to exactly the key the
+  uniquifier wants to generate (``PlayByPlay_2`` -> ``play_by_play_2``)
+  and therefore does occupy it.
+
+Confirmed defect CD-2 and its minimal fix
+-----------------------------------------
+Constraint C2 permits exactly one kind of non-test source change — a
+minimal fix for a genuine bug, called out explicitly with the failing
+case. This module documents one such fix.
+
+* **Site.** ``utils/schema_normalizer.py``, the duplicate-name
+  uniquifier inside ``normalize_result_sets``.
+* **Failing case that motivated it.** A ``playbyplayv2`` envelope whose
+  ``resultSets`` are named, in order, ``PlayByPlay``, ``PlayByPlay_2``,
+  ``PlayByPlay`` — three tables carrying three distinct rows.
+* **Behaviour before the fix.** ``normalize_result_sets`` returned only
+  ``['play_by_play', 'play_by_play_2']`` — **two frames for three
+  upstream tables** — because the third table's generated key
+  ``play_by_play_2`` was already held by the second table and the
+  uniquifier assigned it unconditionally. The second table's DataFrame
+  was replaced by the third's and vanished from the mapping. **No
+  exception was raised**, so a schema-drifting or hostile upstream could
+  delete an entire result table from every downstream DataFrame and CSV
+  artifact while the pipeline reported success (CWE-20, integrity
+  overwrite).
+* **Behaviour after the fix.** ``['play_by_play', 'play_by_play_2',
+  'play_by_play_3']``, with cells ``1``, ``2``, ``3`` respectively — one
+  frame per upstream table, each holding its own data.
+* **The change.** The generated ordinal is a starting point rather than
+  a verdict: a ``while`` probe advances it until the candidate key is
+  unoccupied. No signature, return type, import, raise, or control-flow
+  branch outside the pre-existing duplicate branch was touched, and the
+  McCabe complexity of ``normalize_result_sets`` remains far below the
+  ceiling of 12.
+* **Behaviour deliberately preserved.** Both hand-derived key lists in
+  AAP §0.4.2.3 are unchanged by the fix: three tables all named ``X``
+  still yield ``['x', 'x_2', 'x_3']`` (asserted by the sibling
+  ``test_schema_normalizer.py``), and the near-miss envelope still
+  yields ``['play_by_play', 'play_by_play2', 'play_by_play_2']``. Only
+  the previously destructive branch behaves differently.
+* **The matched test.**
+  :func:`test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table`
+  fails against the unfixed source and passes against the fixed one;
+  :func:`test_duplicate_name_probes_past_consecutive_occupied_keys_without_loss`
+  additionally rules out a one-shot retry that would still lose a table.
 * **Every expected value is hand-derived, never captured.** Each
   constant below is justified by the production source lines cited
   beside it — no assertion compares against recorded output, no
@@ -87,39 +105,29 @@ Test-file contract highlights
   ``--strict-markers``, so this module carries none and runs in every
   invocation mode. It is auto-collected without any configuration
   change because ``pytest.ini`` sets ``python_files = test_*.py``.
-* **A focused sibling, not an edit.** ``test_schema_normalizer.py`` is
-  treated as frozen: its 27 tests, including two deliberately lenient
-  row-mismatch assertions, must keep passing byte-for-byte. This module
-  *supplements* those lenient assertions with verbatim-message
-  equivalents rather than tightening them in place.
 * **Rule 4 is deliberately absent.** Nested-cell rejection and generic
   flatness are owned by
-  ``tests/invariants/test_rule4_no_nested_cells.py`` (and additionally
-  covered in the sibling unit module); re-asserting them here would add
-  no fault detection.
+  ``tests/invariants/test_rule4_no_nested_cells.py``; re-asserting them
+  here would add no fault detection.
+
+Mutation resistance — not a coverage percentage — is the acceptance bar,
+so every test below names the specific change it detects. This project
+ships no coverage instrument by design (``pytest-cov`` and ``coverage``
+are absent and forbidden by the ``tests/conftest.py`` do-not list), and
+no percentage is claimed anywhere.
 
 Authoritative references
 ------------------------
-* AAP §0.2.2.1 — parsing-stage gap inventory (three zero-reference
-  helpers, uncovered non-string-headers and row-not-a-sequence guards).
-* AAP §0.2.2.2 — type-coercion gap inventory (dtype inference, the
-  ``None``-versus-``NaN`` distinction, no string-to-numeric coercion).
-* AAP §0.4.2.3 — the seven exact rejection messages and the
-  duplicate-name uniquification derivation.
-* AAP §0.5.1 / §0.5.2 / §0.8.1 — this module's CREATE mandate and the
-  constraints C1 (no snapshots), C2 (no source modification), C3 (no
-  weakening of existing tests), and C4 (no smoke tests).
 * ``utils/schema_normalizer.py`` — the production contract; every line
   number cited below was read from that file.
-* ``tests/conftest.py`` line 1409 — the shared
-  ``malformed_result_set_payloads`` fixture consumed by the
-  parametrized error-case matrix.
+* ``tests/conftest.py`` — the shared ``malformed_result_set_payloads``
+  fixture consumed by the parametrized error-case matrix.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 
 import pandas as pd
 import pytest
@@ -131,10 +139,10 @@ from utils.schema_normalizer import normalize_result_sets
 # Hand-derived expected values (kept separate from fixture INPUT values)
 # ---------------------------------------------------------------------------
 #
-# Every constant in this section is derived from the production source,
-# not from a recorded run. The line references point at
-# ``utils/schema_normalizer.py``, and the derivation is spelled out so a
-# reviewer can verify each literal without executing anything.
+# Every constant in this section is derived independently from the
+# production source rather than from a recorded run. The line references
+# point at ``utils/schema_normalizer.py`` and each derivation is spelled
+# out beside the literal it produces.
 # ---------------------------------------------------------------------------
 
 #: Verbatim ``ValueError`` text for each rejection branch, keyed by the
@@ -184,9 +192,11 @@ EXPECTED_MESSAGES: Dict[str, str] = {
     ),
     # L321-324: f"Result set '{name}' row {idx} is {type(row).__name__}, "
     #           f"expected list/tuple"
-    # The row TYPE check (L320) precedes the row WIDTH check (L325), so a
-    # dict row raises THIS message and never the width message, even
-    # though {"A": 1} also has a length that could mismatch.
+    # The envelope's row is the dict {"A": 1} against the single header
+    # ["A"], so the row TYPE check (L320) is the only guard it can trip:
+    # the width check (L325) sees len(row) == expected_width == 1. The
+    # rendered type name is therefore "dict" and the row index is 0,
+    # keeping this entry a clean single-branch probe of the TYPE guard.
     "row_not_sequence": (
         "Result set 't' row 0 is dict, expected list/tuple"
     ),
@@ -209,14 +219,14 @@ EXPECTED_REJECTION_BRANCH_COUNT = 7
 #: A fixture cannot be referenced inside ``@pytest.mark.parametrize``, so
 #: the local table drives the matrix and the fixture is indexed by case
 #: name inside the test body. Sorted for a stable test-id ordering.
-MALFORMED_CASES: Tuple[Tuple[str, str], ...] = tuple(
+MALFORMED_CASES: tuple[tuple[str, str], ...] = tuple(
     sorted(EXPECTED_MESSAGES.items())
 )
 
 #: Headers of the inline dtype-probe envelope, in upstream order. The
 #: normalizer passes ``headers`` straight through as ``columns`` (L331),
 #: so column identity and order must survive verbatim.
-EXPECTED_DTYPE_COLUMNS: List[str] = ["PLAYER_ID", "PTS", "NOTE"]
+EXPECTED_DTYPE_COLUMNS: list[str] = ["PLAYER_ID", "PTS", "NOTE"]
 
 #: pandas dtype inference for ``pd.DataFrame(row_set, columns=headers)``
 #: -- the sole construction site (L331) -- over the rowSet
@@ -239,34 +249,89 @@ EXPECTED_DTYPES: Dict[str, str] = {
 #: ``float64`` ``NaN`` and the ``object`` ``None`` report ``True``, which
 #: is exactly why the null mask alone cannot distinguish them and the
 #: dtype plus value identity must be asserted alongside it.
-EXPECTED_PTS_NULL_MASK: List[bool] = [True, False]
-EXPECTED_NOTE_NULL_MASK: List[bool] = [False, True]
+EXPECTED_PTS_NULL_MASK: list[bool] = [True, False]
+EXPECTED_NOTE_NULL_MASK: list[bool] = [False, True]
 
-#: Keys produced by the duplicate-name COLLISION envelope, whose tables
+#: Keys produced by the duplicate-name NEAR-MISS envelope, whose tables
 #: are named ``PlayByPlay``, ``PlayByPlay2``, ``PlayByPlay`` in that
-#: order. Derivation, traced through both ``_snake_case`` regexes
-#: (L396 / L400 / L433-435) and the uniquifier (L142-147):
+#: order. This envelope is a near miss and NOT a true collision: the key
+#: the uniquifier generates for the third table is never occupied. The
+#: genuinely occupied-key case lives in
+#: :data:`EXPECTED_TRUE_COLLISION_KEYS`. Derivation, traced through both
+#: ``_snake_case`` regexes (L396 / L400 / L433-435) and the uniquifier
+#: (L142-157):
 #:
 #: * ``"PlayByPlay"``: ``_CAMEL_BOUNDARY_1`` matches ``"yBy"`` at
 #:   offset 3 -> ``"Play_ByPlay"``; ``_CAMEL_BOUNDARY_2`` then matches
 #:   ``"yP"`` -> ``"Play_By_Play"``; lower/strip -> ``"play_by_play"``.
 #: * ``"PlayByPlay2"``: the same two substitutions give
-#:   ``"Play_By_Play2"`` -> ``"play_by_play2"``. It is a genuinely
-#:   DIFFERENT upstream name, so it takes a bare key and does not
-#:   collide.
+#:   ``"Play_By_Play2"`` -> ``"play_by_play2"``. There is NO underscore
+#:   before the digit, so it is a genuinely DIFFERENT key from the
+#:   ``play_by_play_2`` the uniquifier would generate; it takes a bare
+#:   key and occupies nothing the uniquifier wants.
 #: * The third table snake-cases to ``"play_by_play"``, which is already
-#:   a key, so ``seen_names["play_by_play"] = seen_names.get(
-#:   "play_by_play", 1) + 1`` evaluates to ``2`` and the key becomes
-#:   ``f"play_by_play_{2}"``.
-EXPECTED_COLLISION_KEYS: List[str] = [
+#:   a key, so the ordinal starts at ``seen_names.get("play_by_play",
+#:   1) + 1 == 2``; the candidate ``"play_by_play_2"`` is FREE (only
+#:   ``play_by_play2``, without the underscore, is taken), so the probe
+#:   stops immediately and the key becomes ``"play_by_play_2"``.
+EXPECTED_NEAR_MISS_KEYS: list[str] = [
     "play_by_play",
     "play_by_play2",
     "play_by_play_2",
 ]
 
-#: First-column cell of each collision frame, in key order. The three
+#: First-column cell of each near-miss frame, in key order. The three
 #: distinct values prove no table was lost and none was overwritten.
-EXPECTED_COLLISION_CELLS: List[int] = [1, 2, 3]
+EXPECTED_NEAR_MISS_CELLS: list[int] = [1, 2, 3]
+
+#: Keys produced by the TRUE duplicate-name collision envelope, whose
+#: tables are named ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay`` in
+#: that order. Here the upstream name of the SECOND table snake-cases to
+#: exactly the key the uniquifier wants to generate for the THIRD, so the
+#: generated key is genuinely OCCUPIED. Derivation:
+#:
+#: * Table 1 ``"PlayByPlay"`` -> ``"play_by_play"``; free, taken as-is.
+#: * Table 2 ``"PlayByPlay_2"`` -> ``"play_by_play_2"``; the underscore
+#:   is already present in the upstream name and both regexes leave it
+#:   alone, so this is a bare key and it too is free.
+#: * Table 3 ``"PlayByPlay"`` -> ``"play_by_play"``, already a key. The
+#:   ordinal starts at ``2``, whose candidate ``"play_by_play_2"`` is
+#:   OCCUPIED by table 2, so the probe advances to ``3`` and the key
+#:   becomes ``"play_by_play_3"``.
+#:
+#: Assigning the first candidate unconditionally — which is what the
+#: uniquifier did before the fix recorded in this module's docstring —
+#: replaced table 2's DataFrame with table 3's and returned only TWO
+#: frames for THREE upstream tables, with no exception raised.
+EXPECTED_TRUE_COLLISION_KEYS: list[str] = [
+    "play_by_play",
+    "play_by_play_2",
+    "play_by_play_3",
+]
+
+#: First-column cell of each true-collision frame, in key order. These
+#: three distinct values are the whole point of the test: a correct key
+#: LIST can still hide an overwrite, and only the cells prove that
+#: ``play_by_play_2`` still holds table 2's data rather than table 3's.
+EXPECTED_TRUE_COLLISION_CELLS: list[int] = [1, 2, 3]
+
+#: Keys produced by the CONSECUTIVE-occupancy envelope ``PlayByPlay``,
+#: ``PlayByPlay_2``, ``PlayByPlay_3``, ``PlayByPlay``. The first three
+#: names are distinct and take bare keys ``play_by_play``,
+#: ``play_by_play_2`` and ``play_by_play_3``; the fourth repeats
+#: ``play_by_play``, so the ordinal probe must step over TWO occupied
+#: candidates (``_2`` then ``_3``) before landing on the free ``_4``.
+#: This is the case that distinguishes a probe from a single retry: a
+#: fix that checked the candidate only once would still overwrite here.
+EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS: list[str] = [
+    "play_by_play",
+    "play_by_play_2",
+    "play_by_play_3",
+    "play_by_play_4",
+]
+
+#: First-column cell of each consecutive-occupancy frame, in key order.
+EXPECTED_CONSECUTIVE_OCCUPANCY_CELLS: list[int] = [1, 2, 3, 4]
 
 
 # ---------------------------------------------------------------------------
@@ -277,15 +342,19 @@ EXPECTED_COLLISION_CELLS: List[int] = [1, 2, 3]
 # ``pd.DataFrame(row_set, columns=headers)`` call (L331) and performs no
 # value repair whatsoever: the helper body contains no ``astype``, no
 # ``to_numeric``, no ``fillna``, and no ``convert_dtypes``. Whatever
-# pandas infers from the literal rowSet is therefore the pipeline's real
-# and intended semantics, and it propagates unchanged into every CSV
-# artifact the writer emits.
+# pandas infers from the literal rowSet is therefore the normalizer's
+# real and intended semantics, and it is what the normalizer HANDS TO its
+# caller. The scope of the assertions below is exactly that frame: what
+# ultimately lands in a CSV artifact also depends on the pipeline
+# transforms applied downstream (for example the ``GAME_ID``
+# zero-padding and season-column insertion in the pipelines) and on the
+# writer's own serialization, none of which is under test here.
 #
 # The three tests below pin that inference exactly, because the two
 # plausible "helpful" mutations here are silent data corruption rather
 # than crashes: a ``fillna(0)`` would turn a player's MISSING points
 # into ZERO points, and a ``pd.to_numeric`` would rewrite identifier and
-# measurement columns on disk. Neither would fail any pre-existing test.
+# measurement columns before any consumer ever sees them.
 # ---------------------------------------------------------------------------
 
 
@@ -303,8 +372,7 @@ def test_mixed_row_set_infers_exact_dtype_per_column() -> None:
     type (for example inserting ``convert_dtypes`` or ``astype(str)``),
     and any reordering or renaming of the payload's declared headers.
     """
-    # Arrange -- 203999 is Jokić and 1629029 is Dončić, matching the
-    # real-world identifier space used by the shared payload fixtures.
+    # Arrange
     payload: Dict[str, Any] = {
         "resultSets": [
             {
@@ -350,8 +418,8 @@ def test_none_upcasts_to_nan_in_numeric_column_but_survives_in_object_column() -
 
     Mutation detected: a "helpful" ``pd.to_numeric(..., errors="coerce")``
     or a ``fillna(0)`` inside ``_build_dataframe`` -- the latter would
-    silently convert a player's MISSING points into ZERO points, a
-    data-corruption bug no pre-existing test can see.
+    silently convert a player's MISSING points into ZERO points, which the
+    dtype and null-mask assertions below are what catch.
     """
     # Arrange
     payload: Dict[str, Any] = {
@@ -463,40 +531,59 @@ def test_numeric_supplied_as_string_is_not_coerced_to_a_number() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Duplicate result-set names — the suffix COLLISION case
+# Duplicate result-set names — the NEAR MISS and the TRUE COLLISION
 # ---------------------------------------------------------------------------
 #
 # Duplicate names are a duplicate-record concern inside the PARSING
 # stage: two tables sharing a name must both survive, because the
-# uniquifier (L142-147) is the only thing standing between a repeated
+# uniquifier (L142-157) is the only thing standing between a repeated
 # upstream name and one table's data vanishing from the output.
 #
-# The plain repeat case (three tables all named "X" -> "x", "x_2",
-# "x_3") is already covered by the sibling module and is NOT duplicated
-# here. What is new is the COLLISION: an upstream table whose own name
-# already ends in the digit the uniquifier would append. ``PlayByPlay2``
-# snake-cases to ``play_by_play2`` while a repeated ``PlayByPlay``
-# becomes ``play_by_play_2`` -- the underscore is the only thing
-# separating them, which is exactly the kind of near-miss that a naive
-# suffixing scheme collapses.
+# Two distinct and strictly ordered cases are covered here, and the
+# difference between them is the whole point of this section:
+#
+# 1. NEAR MISS -- ``PlayByPlay``, ``PlayByPlay2``, ``PlayByPlay``.
+#    ``PlayByPlay2`` snake-cases to ``play_by_play2`` (no underscore)
+#    while the repeated ``PlayByPlay`` generates ``play_by_play_2``
+#    (with one). They differ by a single character, so the generated key
+#    is NEVER occupied and the occupied-key branch is never reached.
+#    This case proves the two spellings stay apart; it proves nothing
+#    about occupancy, and its name and docstring say so plainly.
+#
+# 2. TRUE COLLISION -- ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay``.
+#    ``PlayByPlay_2`` snake-cases to exactly ``play_by_play_2``, which
+#    IS the key the uniquifier generates for the third table. This is
+#    the reachable data-destruction case: a single unconditional
+#    assignment replaces the second table's frame with the third's and
+#    returns two frames for three upstream tables, silently, with no
+#    exception. It is the case the fix in this module's docstring closes.
 # ---------------------------------------------------------------------------
 
 
-def test_duplicate_name_colliding_with_numeric_suffix_keeps_every_table() -> None:
-    """A repeated name and a digit-suffixed sibling both survive as distinct keys.
+def test_duplicate_name_beside_a_digit_suffixed_sibling_keeps_every_table() -> None:
+    """A repeated name and a digit-suffixed sibling stay distinct — a NEAR MISS.
 
-    Hand-derived in :data:`EXPECTED_COLLISION_KEYS`: ``PlayByPlay`` ->
+    Hand-derived in :data:`EXPECTED_NEAR_MISS_KEYS`: ``PlayByPlay`` ->
     ``play_by_play``, ``PlayByPlay2`` -> ``play_by_play2`` (a different
-    upstream name, so it keeps a bare key), and the repeated
-    ``PlayByPlay`` -> ``play_by_play_2`` via
-    ``seen_names.get("play_by_play", 1) + 1``. The whole ordered key list
-    is asserted rather than membership, and each frame carries a distinct
-    cell value so overwriting cannot hide behind a correct key count.
+    upstream name with no underscore, so it keeps a bare key), and the
+    repeated ``PlayByPlay`` -> ``play_by_play_2`` from an ordinal that
+    starts at ``seen_names.get("play_by_play", 1) + 1`` and stops
+    immediately because that candidate is free.
 
-    Mutation detected: replacing the suffixing with plain assignment --
-    the third table would overwrite the first and one table's data would
-    vanish entirely; or renumbering the uniquifier to start at one, which
-    would make the repeat collide with the ``play_by_play2`` sibling.
+    This envelope is deliberately a NEAR MISS, not a collision: the
+    generated key is never occupied, so the occupied-key probe is not
+    exercised here. The genuinely occupied case is
+    :func:`test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table`
+    and the two must not be confused — passing this test alone would
+    leave the reachable overwrite undetected.
+
+    Mutations detected: replacing the suffixing with plain assignment --
+    the third table would overwrite the first, leaving two keys and the
+    cells ``[3, 2]``; or dropping the underscore from the suffix so the
+    repeat is keyed ``play_by_play2`` -- it would then overwrite the
+    genuinely different ``PlayByPlay2`` table, again leaving two keys and
+    replacing that table's cell value. The ordered-key assertion and the
+    distinguishing-cell assertion each fail under both changes.
     """
     # Arrange -- the third entry repeats the first name exactly.
     payload: Dict[str, Any] = {
@@ -511,21 +598,143 @@ def test_duplicate_name_colliding_with_numeric_suffix_keeps_every_table() -> Non
     out = normalize_result_sets(payload)
 
     # Assert -- the complete ordered key list, not a membership check.
-    assert list(out.keys()) == EXPECTED_COLLISION_KEYS, (
+    assert list(out.keys()) == EXPECTED_NEAR_MISS_KEYS, (
         f"duplicate names must be uniquified without colliding with a "
-        f"digit-suffixed sibling; expected {EXPECTED_COLLISION_KEYS} but got "
+        f"digit-suffixed sibling; expected {EXPECTED_NEAR_MISS_KEYS} but got "
         f"{list(out.keys())}"
     )
-    assert len(out) == len(EXPECTED_COLLISION_KEYS), (
+    assert len(out) == len(EXPECTED_NEAR_MISS_KEYS), (
         f"all three tables must survive; expected "
-        f"{len(EXPECTED_COLLISION_KEYS)} frames but got {len(out)}"
+        f"{len(EXPECTED_NEAR_MISS_KEYS)} frames but got {len(out)}"
     )
 
     # Assert -- distinguishing cells prove nothing was overwritten.
-    observed_cells = [int(out[key].iloc[0, 0]) for key in EXPECTED_COLLISION_KEYS]
-    assert observed_cells == EXPECTED_COLLISION_CELLS, (
+    observed_cells = [int(out[key].iloc[0, 0]) for key in EXPECTED_NEAR_MISS_KEYS]
+    assert observed_cells == EXPECTED_NEAR_MISS_CELLS, (
         f"each key must map to its own table's data; expected cells "
-        f"{EXPECTED_COLLISION_CELLS} but got {observed_cells}"
+        f"{EXPECTED_NEAR_MISS_CELLS} but got {observed_cells}"
+    )
+
+
+def test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table() -> None:
+    """A repeat whose generated ``_2`` key is already TAKEN must not overwrite it.
+
+    This is the reachable data-destruction case, and the failing case
+    that motivated the one-statement uniquifier fix recorded in this
+    module's docstring. Upstream envelope, in order: ``PlayByPlay``
+    (cell ``1``), ``PlayByPlay_2`` (cell ``2``), ``PlayByPlay`` (cell
+    ``3``).
+
+    Hand-derived in :data:`EXPECTED_TRUE_COLLISION_KEYS`: table 2's own
+    name snake-cases to ``play_by_play_2``, which is EXACTLY the key the
+    uniquifier generates for table 3, so the ordinal must advance from
+    ``2`` to the free ``3`` and produce ``play_by_play_3``.
+
+    Before the fix this envelope returned only ``['play_by_play',
+    'play_by_play_2']`` with ``play_by_play_2`` holding cell ``3`` --
+    two frames for three upstream tables, table 2's data destroyed, and
+    NO exception raised. A schema-drifting or hostile upstream could
+    therefore delete an entire result table from every downstream
+    DataFrame and CSV artifact while the pipeline reported success.
+
+    Mutation detected: reverting the probe to a single
+    ``seen_names.get(name, 1) + 1`` assignment. The length assertion, the
+    key-list assertion and the cell assertion each fail independently,
+    and the cell assertion is the one that proves the surviving frame is
+    table 2's data rather than table 3's.
+    """
+    # Arrange -- table 2's upstream name IS table 3's generated key.
+    payload: Dict[str, Any] = {
+        "resultSets": [
+            {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[1]]},
+            {"name": "PlayByPlay_2", "headers": ["A"], "rowSet": [[2]]},
+            {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[3]]},
+        ]
+    }
+    expected_table_count = len(payload["resultSets"])
+
+    # Act
+    out = normalize_result_sets(payload)
+
+    # Assert -- loss-free first: three tables in, three frames out.
+    assert len(out) == expected_table_count, (
+        f"the uniquifier must never drop a table; the envelope declared "
+        f"{expected_table_count} result sets but normalize_result_sets "
+        f"returned {len(out)} frames ({list(out.keys())}). A missing frame "
+        f"means one table silently overwrote another"
+    )
+
+    # Assert -- the complete ordered key list, not a membership check.
+    assert list(out.keys()) == EXPECTED_TRUE_COLLISION_KEYS, (
+        f"the repeated name's generated key was already occupied, so the "
+        f"ordinal must advance past it; expected "
+        f"{EXPECTED_TRUE_COLLISION_KEYS} but got {list(out.keys())}"
+    )
+
+    # Assert -- distinguishing cells prove WHICH table each key holds. A
+    # correct key list alone cannot detect an overwrite; this can.
+    observed_cells = [int(out[key].iloc[0, 0]) for key in EXPECTED_TRUE_COLLISION_KEYS]
+    assert observed_cells == EXPECTED_TRUE_COLLISION_CELLS, (
+        f"each key must map to its OWN table's data; expected cells "
+        f"{EXPECTED_TRUE_COLLISION_CELLS} but got {observed_cells}. A "
+        f"{EXPECTED_TRUE_COLLISION_CELLS[-1]} under key "
+        f"{EXPECTED_TRUE_COLLISION_KEYS[1]!r} means the last table "
+        f"overwrote the second"
+    )
+
+
+def test_duplicate_name_probes_past_consecutive_occupied_keys_without_loss() -> None:
+    """The ordinal probe steps over EVERY occupied candidate, not just one.
+
+    Upstream envelope, in order: ``PlayByPlay`` (cell ``1``),
+    ``PlayByPlay_2`` (cell ``2``), ``PlayByPlay_3`` (cell ``3``),
+    ``PlayByPlay`` (cell ``4``). Hand-derived in
+    :data:`EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS`: the first three names
+    are distinct and take bare keys, then the repeat's ordinal must step
+    over TWO occupied candidates (``play_by_play_2``, then
+    ``play_by_play_3``) before landing on the free ``play_by_play_4``.
+
+    Mutation detected: a one-shot retry — checking the candidate once and
+    incrementing a single time instead of looping — which would land back
+    on the occupied ``play_by_play_3`` and destroy table 3. That mutation
+    passes
+    :func:`test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table`
+    (where a single step is enough) and is caught only here.
+    """
+    # Arrange -- two consecutive generated candidates are pre-occupied.
+    payload: Dict[str, Any] = {
+        "resultSets": [
+            {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[1]]},
+            {"name": "PlayByPlay_2", "headers": ["A"], "rowSet": [[2]]},
+            {"name": "PlayByPlay_3", "headers": ["A"], "rowSet": [[3]]},
+            {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[4]]},
+        ]
+    }
+    expected_table_count = len(payload["resultSets"])
+
+    # Act
+    out = normalize_result_sets(payload)
+
+    # Assert -- loss-free: four tables in, four frames out.
+    assert len(out) == expected_table_count, (
+        f"the uniquifier must never drop a table; the envelope declared "
+        f"{expected_table_count} result sets but normalize_result_sets "
+        f"returned {len(out)} frames ({list(out.keys())})"
+    )
+
+    # Assert -- the complete ordered key list.
+    assert list(out.keys()) == EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS, (
+        f"the probe must advance past every occupied candidate; expected "
+        f"{EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS} but got {list(out.keys())}"
+    )
+
+    # Assert -- every table's own data survives under its own key.
+    observed_cells = [
+        int(out[key].iloc[0, 0]) for key in EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS
+    ]
+    assert observed_cells == EXPECTED_CONSECUTIVE_OCCUPANCY_CELLS, (
+        f"each key must map to its OWN table's data; expected cells "
+        f"{EXPECTED_CONSECUTIVE_OCCUPANCY_CELLS} but got {observed_cells}"
     )
 
 
@@ -533,14 +742,14 @@ def test_duplicate_name_colliding_with_numeric_suffix_keeps_every_table() -> Non
 # Malformed envelopes — the seven exact ValueError messages
 # ---------------------------------------------------------------------------
 #
-# This section gives ``_extract_tables`` (L155), ``_require_str``
-# (L208), and ``_require_list`` (L240) their first-ever coverage, plus
-# the previously unexercised non-string-headers branch (L134) and
-# row-not-a-sequence branch (L320). All five are reached exclusively
-# through the public ``normalize_result_sets``; no private helper is
-# imported and no production source file is touched.
+# The five guards exercised here -- ``_extract_tables`` (L155),
+# ``_require_str`` (L208), ``_require_list`` (L240), the
+# non-string-headers branch (L134) and the row-not-a-sequence branch
+# (L320) -- are all reached exclusively through the public
+# ``normalize_result_sets``; no private helper is imported and no
+# production source file is touched.
 #
-# Guard order inside the per-table loop (L129-140) determines which
+# Guard ORDER inside the per-table loop (L129-140) determines which
 # envelope trips which branch, so the shared fixture's shapes are
 # minimal but deliberate:
 #
@@ -549,15 +758,15 @@ def test_duplicate_name_colliding_with_numeric_suffix_keeps_every_table() -> Non
 #   L132  row_set = _require_list(table, "rowSet")
 #   L134  non-string headers check   (AFTER both _require_list calls)
 #   L139  _build_dataframe -> row TYPE check (L320) then WIDTH (L325)
-#   L140  _assert_rule4_flat          (Rule 4; covered elsewhere)
 #
 # Because ``pytest.raises(match=...)`` runs a ``re.search``, every
 # pattern below is wrapped in ``re.escape``: the messages contain ``'``,
 # ``[``, ``]``, ``(``, and ``)``, and an unescaped ``[`` or ``(`` would
 # become a character class or capture group -- a pattern that still
-# matches, but for the wrong reason. Two branches are additionally
-# asserted with full-string ``==`` equality, which is strictly stronger
-# than a containment search.
+# matches, but for the wrong reason. Every case is additionally asserted
+# with full-string ``==`` equality, which is strictly stronger than a
+# containment search, and the row-width branch gets a dedicated boundary
+# test that does the same.
 # ---------------------------------------------------------------------------
 
 
@@ -566,16 +775,19 @@ def test_malformed_fixture_supplies_exactly_one_envelope_per_rejection_branch(
 ) -> None:
     """The shared fixture's case names match this module's expected-message table exactly.
 
-    Guards the parametrized matrix below against silent shrinkage: the
-    matrix is driven by :data:`EXPECTED_MESSAGES` and indexes the fixture
-    by case name, so a renamed or removed envelope would otherwise
-    surface as a confusing ``KeyError`` instead of a clear contract
-    failure. Exact set equality and an exact count are asserted, not
-    membership or a lower bound.
+    Keeps the fixture and this module's expected-message table in step.
+    The parametrized matrix below is driven by :data:`EXPECTED_MESSAGES`,
+    so its size is fixed by this module and cannot shrink when the
+    fixture changes; instead a renamed or removed envelope makes the
+    fixture lookup inside the parametrized test raise a confusing
+    ``KeyError``. This test converts that into a clear contract failure by
+    asserting exact set equality and an exact count -- not membership and
+    not a lower bound.
 
-    Mutation detected: dropping or renaming a rejection-branch envelope
-    in ``tests/conftest.py``, which would reduce the error-case matrix
-    below seven and leave a validation guard unexercised again.
+    Mutation detected: dropping or renaming a rejection-branch envelope in
+    ``tests/conftest.py``. The set-equality assertion names the missing or
+    renamed case directly, which is what stops a validation guard from
+    quietly losing its envelope.
     """
     # Arrange / Act -- the fixture IS the value under test.
     observed_cases = set(malformed_result_set_payloads)
@@ -607,10 +819,14 @@ def test_malformed_envelope_raises_valueerror_with_exact_message(
     ``ValueError`` here confirms the DATA-error path rather than the
     programmer-error path.
 
-    Mutation detected: deleting or loosening any validation guard -- a
-    removed ``raise`` would let a malformed envelope through silently --
-    and any drift in the operator-facing message text, such as dropping
-    the result-set name or the offending row index.
+    Mutations detected: deleting or loosening any of these validation
+    guards, and any drift in the operator-facing message text such as
+    dropping the result-set name or the offending row index. Removing a
+    guard does not necessarily produce silent acceptance -- some shapes go
+    on to fail deeper inside pandas with an unrelated exception type
+    instead. Either way the diagnostic contract breaks: this test fails
+    because the raised class is no longer ``ValueError`` or the message no
+    longer names what was wrong and where.
     """
     # Arrange
     payload = malformed_result_set_payloads[case]
@@ -638,16 +854,12 @@ def test_row_narrower_than_headers_reports_index_count_and_declared_width(
 
     Hand-derived from L326-329 with the fixture's own numbers: row index
     ``0``, ``len(row) == 2``, and ``expected_width == len(headers) == 3``.
-    The sibling module already covers this branch, but only leniently --
-    one test asserts the snake_case set name appears and another accepts
-    either the word "row" or the word "index". This test supplements
-    those with full-string equality, which is the new information; the
-    lenient assertions are left untouched.
+    Full-string equality is asserted, so every component of the message is
+    pinned rather than merely its presence.
 
     Mutation detected: changing the reported row index, the reported
-    value count, or the declared-header count; swapping the width check
-    ahead of the row-type check; or moving the width check somewhere that
-    no longer names the offending row.
+    value count, or the declared-header count; or moving the width check
+    somewhere that no longer names the offending row.
     """
     # Arrange
     payload = malformed_result_set_payloads["row_width_mismatch"]
@@ -665,41 +877,4 @@ def test_row_narrower_than_headers_reports_index_count_and_declared_width(
     assert type(exc_info.value) is ValueError, (
         f"a shape mismatch is a DATA error and must raise ValueError, not "
         f"{type(exc_info.value).__name__}"
-    )
-
-
-def test_row_supplied_as_dict_trips_the_type_guard_before_the_width_guard(
-    malformed_result_set_payloads: Dict[str, Any],
-) -> None:
-    """A dict row raises the row-TYPE message, never the row-WIDTH message.
-
-    Inside ``_build_dataframe`` the ``isinstance(row, (list, tuple))``
-    check (L320) precedes the ``len(row) != expected_width`` check
-    (L325). The fixture's envelope declares one header and supplies the
-    row ``{"A": 1}``, whose length is also one -- so the width guard
-    would not fire even if it ran first. Asserting the type message and
-    the absence of the width wording together pins the ordering itself,
-    not merely the outcome.
-
-    Mutation detected: reordering the two guards, or replacing the type
-    check with a bare ``len()`` call, which would raise ``TypeError`` on
-    an unsized row instead of a diagnostic ``ValueError``.
-    """
-    # Arrange
-    payload = malformed_result_set_payloads["row_not_sequence"]
-    expected_message = EXPECTED_MESSAGES["row_not_sequence"]
-
-    # Act
-    with pytest.raises(ValueError) as exc_info:
-        normalize_result_sets(payload)
-    message = str(exc_info.value)
-
-    # Assert -- the type message verbatim ...
-    assert message == expected_message, (
-        f"a dict row must raise exactly {expected_message!r}; got {message!r}"
-    )
-    # ... and demonstrably NOT the width message that follows it.
-    assert "headers are declared" not in message, (
-        f"the row-type guard must fire before the row-width guard; "
-        f"got the width wording in {message!r}"
     )

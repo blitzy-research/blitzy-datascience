@@ -12,42 +12,19 @@ Four contracts are pinned here:
    form.** Five team-rows describing three games must collapse to
    exactly three identifiers, each exactly ten characters wide — the
    zero-padded form the helper's own docstring promises.
-2. **Five row- and envelope-shape guards** that were genuinely
-   uncovered: a row shorter than the ``GAME_ID`` index, an empty row, a
-   ``None`` ``GAME_ID`` cell, a table that declares ``GAME_ID`` but
-   carries no ``rowSet`` key at all, and ``resultSets`` delivered as a
-   dict instead of a list.
-3. **The degrade-to-``[]``-rather-than-raise contract.** The helper is
-   documented never to raise on envelope shape, so each degradation
-   test asserts ``result == []`` exactly — never a bare "it did not
-   raise", and never ``assert not result``, which would also accept
-   ``None``, ``0``, or ``""``.
-4. **Defect CD-1 — duplicate-record leakage from mixed identifier wire
-   types.** See the dedicated test at the bottom of this module.
-
-Why this is a separate sibling module
--------------------------------------
-
-``test_schedule.py`` is already 376 lines / 14 tests, and its
-``test_enumerate_game_ids_casts_to_str`` is deliberately weak — its only
-assertions are a truthiness check and an ``isinstance`` scan. That test
-is **supplemented** by the tests here, never edited, tightened, renamed,
-or extended in place. A focused sibling module keeps this one concern
-reviewable in isolation, and is collected automatically because
-``pytest.ini`` sets ``python_files = test_*.py``.
-
-The verified gap
-----------------
-
-Each of the five guards above was confirmed uncovered by grepping the
-whole ``tests/`` tree before this module was written. All five searches
-returned zero relevant hits:
-
-* a row shorter than the ``GAME_ID`` index — 0 hits
-* a bare ``[]`` row inside a ``rowSet`` — 0 hits
-* a ``None`` ``GAME_ID`` cell — 0 hits
-* a table with ``headers`` but no ``rowSet`` key — 0 hits
-* ``"resultSets"`` supplied as a dict — 0 hits
+2. **Five row- and envelope-shape guards**: a row shorter than the
+   ``GAME_ID`` index, an empty row, a ``None`` ``GAME_ID`` cell, a table
+   that declares ``GAME_ID`` but carries no ``rowSet`` key at all, and
+   ``resultSets`` delivered as a dict instead of a list.
+3. **Degrading to an empty list rather than raising.** Where the helper
+   is documented to return ``[]`` instead of raising, each test asserts
+   ``result == []`` exactly — never a bare "it did not raise", and never
+   ``assert not result``, which would also accept ``None``, ``0``, or
+   ``""``.
+4. **Canonicalization across mixed identifier wire types**, so one game
+   delivered as both an integer and a zero-padded string collapses to a
+   single identifier. See the dedicated test at the bottom of this
+   module.
 
 Hand-derived expected values
 ----------------------------
@@ -89,7 +66,7 @@ name follows from ``get_logger(__name__)`` in ``endpoints/schedule.py``.
 ``pytest.warns`` would not see these records and must not be
 substituted here. Message assertions use lenient substring matching so
 the production format string stays uncoupled from the test, matching the
-convention already established in ``test_schedule.py``.
+substring-matching convention used in ``test_schedule.py``.
 
 Rule compliance
 ---------------
@@ -138,10 +115,12 @@ EXPECTED_SURVIVING_GAME_IDS = ["0022500001", "0022500002"]
 #: different game. Keying on the canonical zero-padded form collapses rows
 #: 1-2 into one identifier, so 3 input rows describe 2 distinct games.
 #:
-#: The arithmetic that makes the unpadded form a defect rather than a
-#: preference: ``str(22500001)`` is ``"22500001"`` (8 characters) while
-#: ``str("0022500001")`` is ``"0022500001"`` (10 characters), so keying on the
-#: unpadded string form yields THREE identifiers for TWO games.
+#: The arithmetic behind that equivalence: ``str(22500001)`` is
+#: ``"22500001"`` (8 characters) while ``str("0022500001")`` is
+#: ``"0022500001"`` (10 characters). Two spellings of one identifier are only
+#: recognised as equal once both are widened to the canonical 10-character
+#: form; keying on the unpadded string form instead yields THREE identifiers
+#: for TWO games.
 EXPECTED_MIXED_TYPE_GAME_IDS = ["0022500001", "0022500002"]
 
 #: The canonical NBA ``GAME_ID`` width promised by ``enumerate_game_ids``' own
@@ -168,12 +147,11 @@ def test_enumerate_game_ids_collapses_five_team_rows_to_three_canonical_ids(
     output is ordered by first appearance. Every identifier literal in the
     fixture is already the 10-character zero-padded form.
 
-    The list-equality assertion overlaps
-    ``test_schedule.py::test_enumerate_game_ids_returns_deduplicated_first_seen_order``
-    and is kept only because it is what makes the other two assertions
-    interpretable. **The new information is the 5 -> 3 collapse CARDINALITY
-    and the every-element-is-ten-characters CANONICAL FORM**, neither of which
-    is asserted anywhere else in the suite.
+    Three properties are asserted together: the exact ordered list, the
+    5 -> 3 collapse CARDINALITY, and the every-element-is-ten-characters
+    CANONICAL FORM. The list equality is what makes the other two
+    interpretable, since a count and a width mean little without knowing
+    which identifiers were produced.
 
     Mutation detected: dropping the dedupe — for example rewriting the loop as
     ``ordered_ids = [str(row[game_id_index]) for row in rows]`` — returns all 5
@@ -223,10 +201,6 @@ def test_enumerate_game_ids_skips_row_shorter_than_the_game_id_index(recording_c
     evaluates ``2 >= 2`` -> ``True`` and the row is skipped. Rows 1 and 3
     survive in first-seen order, giving exactly 2 identifiers from 3 input
     rows.
-
-    A ragged row is realistic rather than contrived: the upstream truncates
-    trailing cells when a game has not yet been played, so the enumerator must
-    tolerate the shape instead of aborting the whole season's enumeration.
 
     Mutation detected: removing the ``game_id_index >= len(row)`` clause from
     the guard makes ``row[game_id_index]`` subscript position 2 of a 2-element
@@ -284,9 +258,11 @@ def test_enumerate_game_ids_skips_empty_row(recording_client):
     are true for ``[]``: ``not []`` is ``True``, and ``game_id_index >=
     len([])`` is ``2 >= 0`` -> ``True``. Removing only the ``not row`` clause
     would therefore STILL skip this row, so this test does not claim otherwise.
-    What the ``not row`` clause specifically protects against is a row that is
-    ``None`` or otherwise not sized, where evaluating ``len(row)`` would raise
-    ``TypeError`` before the second clause could short-circuit it.
+    What the ``not row`` clause adds is short-circuiting on a FALSY row — a
+    ``None`` cell in place of a row, for instance — so ``len(row)`` is never
+    evaluated for it. It is not a general defence against unsized rows: a
+    truthy object with no ``__len__`` still reaches ``len(row)`` and raises
+    ``TypeError``.
     """
     # Arrange — envelope built inline so the empty row sits beside the header
     # list that gives GAME_ID index 2.
@@ -396,12 +372,10 @@ def test_enumerate_game_ids_returns_empty_list_when_row_set_key_is_absent(
 ):
     """A table declaring ``GAME_ID`` with NO ``rowSet`` key yields exactly ``[]``.
 
-    This is a **different input shape** from
-    ``test_schedule.py::test_enumerate_game_ids_empty_rowset_returns_empty_list``,
-    which supplies ``"rowSet": []`` — the key PRESENT with an empty value. Here
-    the ``"rowSet"`` key is ABSENT ENTIRELY. Production normalizes both shapes
-    at ``rows = list(target_table.get("rowSet") or [])``, but only the
-    key-present shape was covered before this test, so this is not a duplicate.
+    The shape under test is the ``"rowSet"`` key being **absent entirely**,
+    which is distinct from ``"rowSet": []`` — the key present with an empty
+    value. Production normalizes both at
+    ``rows = list(target_table.get("rowSet") or [])``.
 
     Hand derivation: ``resultSets`` is non-empty and the table's ``headers``
     contain ``"GAME_ID"``, so ``target_table`` **IS** found. ``.get("rowSet")``
@@ -414,8 +388,9 @@ def test_enumerate_game_ids_returns_empty_list_when_row_set_key_is_absent(
     distinguishes this branch from the two envelope branches that DO warn.
 
     Mutation detected: replacing ``target_table.get("rowSet") or []`` with
-    ``target_table["rowSet"]`` raises ``KeyError`` instead of degrading, which
-    breaks the helper's documented "never raises on payload shape" contract.
+    ``target_table["rowSet"]``, which raises ``KeyError`` for this envelope
+    instead of returning ``[]`` and turns a table that simply carries no rows
+    into a fatal enumeration failure.
     """
     # Arrange — a single table with "name" and "headers" but no "rowSet" key.
     payload = {
@@ -470,12 +445,10 @@ def test_enumerate_game_ids_returns_empty_list_and_warns_when_result_sets_is_a_d
     WARNING fires and exactly ``[]`` is returned.
 
     The dict is deliberately NON-EMPTY. An empty ``{}`` is falsy and would fire
-    the *empty-payload* branch instead — the branch already covered by
-    ``test_schedule.py::test_enumerate_game_ids_missing_resultsets_returns_empty``
-    — so only a non-empty dict reaches the ``isinstance``-False path under test.
-    The irony worth recording: the ``GAME_ID`` header **is** present inside the
-    nested value below, but because the outer container is a dict rather than a
-    list, the header-based discovery loop never sees it.
+    the *empty-payload* branch instead, so only a non-empty dict reaches the
+    ``isinstance``-False path under test. Note that the ``GAME_ID`` header **is**
+    present inside the nested value below, yet because the outer container is a
+    dict rather than a list the header-based discovery loop never sees it.
 
     The message assertion uses lenient substring matching on the phrase "no
     GAME_ID column" only. That phrase is what distinguishes this branch from
@@ -526,7 +499,7 @@ def test_enumerate_game_ids_returns_empty_list_and_warns_when_result_sets_is_a_d
 
 
 # ---------------------------------------------------------------------------
-# Defect CD-1 — duplicate-record leakage from mixed identifier wire types
+# Mixed numeric/string GAME_ID canonicalization
 # ---------------------------------------------------------------------------
 
 
@@ -535,59 +508,40 @@ def test_enumerate_game_ids_collapses_mixed_int_and_str_forms_of_one_game(
 ):
     """One game arriving as both int and str MUST collapse to ONE canonical id.
 
-    This is the regression test for **defect CD-1**. The
-    ``schedule_mixed_game_id_payload`` fixture carries 3 rows describing only 2
-    distinct games, with ``headers`` giving ``GAME_ID`` index 2:
+    The ``schedule_mixed_game_id_payload`` fixture carries 3 rows describing
+    only 2 distinct games, with ``headers`` giving ``GAME_ID`` index 2:
 
     1. ``GAME_ID`` as the bare integer ``22500001``
     2. **the same game**, ``GAME_ID`` as the string ``"0022500001"``
     3. a genuinely different control game, ``"0022500002"``
 
-    Hand derivation, and why the unpadded form is a defect: ``str(22500001)``
-    is ``"22500001"`` — **8** characters — while ``str("0022500001")`` is
-    ``"0022500001"`` — **10**. Keying the dedupe on the unpadded string form
-    therefore treats rows 1 and 2 as different games and returns
-    ``["22500001", "0022500001", "0022500002"]`` — **three identifiers for two
-    games**. ``pipelines.ingest_games.run`` then fetches and appends that one
-    game twice, duplicating its rows in ``games.csv``. Keying on the
+    Hand derivation: ``str(22500001)`` is ``"22500001"`` — **8** characters —
+    while ``str("0022500001")`` is ``"0022500001"`` — **10**. Keying the dedupe
+    on the unpadded string form therefore treats rows 1 and 2 as different
+    games and returns ``["22500001", "0022500001", "0022500002"]`` — **three
+    identifiers for two games** — after which
+    ``pipelines.ingest_games.run`` fetches and appends that one game twice,
+    duplicating its rows in ``games.csv``. Widening each key to the
     10-character zero-padded canonical form instead yields exactly 2
     identifiers, every element 10 characters wide. The padding is idempotent,
     so ``"0022500001"`` and ``"0022500002"`` pass through byte-identical.
 
-    The envelope is realistic rather than contrived: the inline commentary in
-    ``endpoints/schedule.py`` already records that the upstream occasionally
-    returns numeric types for identifiers that look numeric.
+    Ten-character zero-padding is the canonical ``GAME_ID`` form throughout
+    this codebase: ``enumerate_game_ids``' own docstring promises
+    "10-character zero-padded identifiers such as ``0022500001``",
+    ``pipelines/ingest_games.py`` applies the mirror-image ``.str.zfill(10)``
+    normalization when matching pending identifiers against CSV cells, and
+    ``endpoints/games.py`` warns that stripping leading zeros corrupts the ID
+    so callers must preserve the string form upstream. The envelope is
+    realistic rather than contrived — the inline commentary in
+    ``endpoints/schedule.py`` records that the upstream occasionally returns
+    numeric types for identifiers that look numeric — and nothing downstream
+    would absorb the duplicate, because ``utils/checkpoint.py::get_pending``
+    returns the original elements verbatim in their original order.
 
-    Five independent witnesses establish that the unpadded behavior was a
-    defect rather than deliberate policy:
-
-    (a) ``enumerate_game_ids``' **own docstring** promises "10-character
-        zero-padded identifiers such as ``0022500001``"; an 8-character key
-        violates the documented return contract.
-    (b) ``pipelines/ingest_games.py`` implements the **mirror-image**
-        ``.str.zfill(10)`` normalization on the CSV side and names this exact
-        failure mode verbatim — "upstream pending id ``0022500001`` vs
-        stripped-prefix cell value ``22500001``". Ten-character padding is
-        therefore already the codebase's canonical form.
-    (c) ``utils/checkpoint.py::get_pending`` does **not** deduplicate its own
-        input — its docstring states the returned list "contains the original
-        elements verbatim" in "their original input order" — so an unpadded
-        duplicate survives intact into the fetch loop. There is no downstream
-        guard that would absorb it.
-    (d) ``endpoints/games.py``, the direct downstream consumer of this output,
-        states that "Stripping leading zeros (via int conversion) corrupts the
-        ID, so callers must preserve the string form upstream."
-    (e) ``test_games.py::test_fetch_boxscoretraditionalv2_casts_game_id_to_str``
-        states that it does NOT assert the zero-padded format is re-introduced
-        for integer inputs because "that is the caller's responsibility, not
-        the wrapper's". ``enumerate_game_ids`` **is** that responsible caller,
-        so CD-1 was its failure to discharge a duty the suite itself assigns
-        to it.
-
-    Mutation detected: this test is the direct canary for the padding
-    statement. Removing it — reverting the key derivation to a bare
-    ``str(game_id)`` — reintroduces the 3-ids-for-2-games leak and fails all
-    three assertions below.
+    Mutation detected: dropping the ``zfill(10)`` widening from the key
+    derivation, leaving a bare ``str(game_id)``. That reintroduces the
+    3-identifiers-for-2-games leak and fails all three assertions below.
     """
     # Arrange
     client = recording_client(

@@ -565,52 +565,24 @@ def test_rule5_checkpoint_round_trip_alias(tmp_path: Path) -> None:
 # Phase 2.15 — `get_pending` duplicate / element-type / order guarantees
 # ---------------------------------------------------------------------------
 #
-# The four tests below pin the three semantics of
-# :meth:`utils.checkpoint.CheckpointManager.get_pending` that the five
-# pre-existing ``get_pending`` tests in Phase 2.6 above leave unasserted.
-# Every expected value is derived BY HAND from the two statements that
-# constitute the method's body in ``utils/checkpoint.py`` (lines 542-548)::
+# Four contracts of :meth:`utils.checkpoint.CheckpointManager.get_pending`,
+# every expected value derived BY HAND from the method's documented behaviour
+# rather than from a captured run:
+#   1. Duplicate INPUT keys survive verbatim — the filter is applied against
+#      the set of COMPLETED keys, and ``all_keys`` is never deduplicated.
+#   2. Surviving elements are the ORIGINAL objects with their original types;
+#      the ``str`` coercion serves the membership test only, and its result is
+#      discarded, as the method docstring promises ("the returned list contains
+#      the original elements verbatim").
+#   3. Surviving elements keep INPUT order, which is what makes the pipelines'
+#      chronological ``GAME_ID`` replay deterministic.
+#   4. Marking one key filters EVERY duplicate of it, because the predicate is
+#      evaluated independently for each element.
 #
-#     with self._lock:
-#         completed = set(self._state.get(domain, {}).keys())
-#     return [k for k in all_keys if str(k) not in completed]
-#
-# Three facts follow directly from those two statements, and each is
-# pinned by the tests that follow:
-#   1. The ``set()`` is applied to the COMPLETED keys, never to
-#      ``all_keys`` — so duplicates in the input survive verbatim.
-#   2. ``str(k)`` is evaluated ONLY inside the membership test and its
-#      result is then discarded — so the returned list holds the
-#      ORIGINAL element objects with their original types, exactly as
-#      the method docstring (lines 516-520) promises: "the returned
-#      list contains the original elements verbatim".
-#   3. The predicate is evaluated independently for EVERY element — so
-#      marking one key filters every duplicate of it, not just the
-#      first occurrence.
-#
-# The fault these four tests exist to catch is one plausible mutation:
-# wrapping ``all_keys`` in ``set()`` "for efficiency". That would
-# silently drop legitimate duplicate keys AND silently reorder the fetch
-# sequence, destroying the chronological ``GAME_ID`` replay determinism
-# the pipelines depend on. The sibling ``[str(k) for k in all_keys ...]``
-# mutation would additionally break the element-type guarantee.
-#
-# Each test below is paired with exactly one mutant that it detects
-# DETERMINISTICALLY:
-#   * ``set(all_keys)``            -> the duplicate-input test, because
-#     the three-element input collapses to two elements regardless of
-#     the set's iteration order, so the length assertion always fires.
-#   * remove-first-occurrence-only -> the every-duplicate test.
-#   * ``[str(k) for k in ...]``    -> the element-type test.
-#   * ``sorted(...)``              -> the input-order test.
-#
-# None of those four mutants is reliably caught by the pre-existing
-# Phase 2.6 tests: ``sorted(...)``, ``[str(k) ...]`` and
-# remove-first-occurrence leave all five of them green, and ``set()`` is
-# caught by the Phase 2.6 order test only incidentally — only when
-# CPython's per-process string-hash randomization happens to produce a
-# set ordering that differs from the input ordering, which is not a
-# dependable signal.
+# Each test below names the single mutation it detects. Wrapping ``all_keys``
+# in ``set()`` "for efficiency" breaches contracts 1 and 3 at once, which is
+# why the duplicate-input test asserts a length that no collapsed container
+# can satisfy regardless of its iteration order.
 # ---------------------------------------------------------------------------
 
 
@@ -618,10 +590,10 @@ def test_get_pending_does_not_deduplicate_duplicate_input_keys(tmp_path: Path) -
     """``get_pending`` must NOT deduplicate its own ``all_keys`` input.
 
     Hand derivation — nothing is marked completed, so ``completed`` is
-    the empty set; the comprehension at ``utils/checkpoint.py`` line 548
-    then evaluates ``str(k) not in completed`` independently for each of
-    the three elements of ``["a", "a", "b"]`` and every one passes, so
-    all three survive in input order — including the repeated ``"a"``.
+    the empty set; the filtering comprehension then evaluates
+    ``str(k) not in completed`` independently for each of the three
+    elements of ``["a", "a", "b"]`` and every one passes, so all three
+    survive in input order — including the repeated ``"a"``.
 
     Deterministically detects the ``set(all_keys)`` /
     ``dict.fromkeys(all_keys)`` "efficiency" mutation: either one
@@ -650,10 +622,9 @@ def test_get_pending_filters_every_duplicate_of_a_completed_key(tmp_path: Path) 
     """A completed key filters EVERY duplicate of itself, not just the first.
 
     Hand derivation — ``mark_completed("games", "a")`` makes
-    ``completed == {"a"}``; the comprehension at ``utils/checkpoint.py``
-    line 548 then evaluates the predicate independently for each element
-    of ``["a", "a", "b"]``, so BOTH ``"a"`` entries are dropped and only
-    ``"b"`` survives.
+    ``completed == {"a"}``; the filtering comprehension then evaluates the
+    predicate independently for each element of ``["a", "a", "b"]``, so
+    BOTH ``"a"`` entries are dropped and only ``"b"`` survives.
 
     Deterministically detects a ``list.remove``-style
     first-occurrence-only filter, or any early-exit mutation: either
@@ -685,12 +656,12 @@ def test_get_pending_returns_original_element_objects_not_string_coercions(tmp_p
     """``get_pending`` returns the original element objects, not ``str`` copies.
 
     Hand derivation — nothing is marked completed, so ``completed`` is
-    empty and every element passes the predicate. The comprehension at
-    ``utils/checkpoint.py`` line 548 emits ``k`` itself; ``str(k)`` is
-    evaluated only inside the membership test and its result is
-    discarded. So ``[1, 2]`` comes back as ``[1, 2]`` — genuine ``int``
-    objects — exactly as the method docstring (lines 516-520) promises:
-    "the returned list contains the original elements verbatim".
+    empty and every element passes the predicate. The filtering
+    comprehension emits ``k`` itself; ``str(k)`` is evaluated only inside
+    the membership test and its result is discarded. So ``[1, 2]`` comes
+    back as ``[1, 2]`` — genuine ``int`` objects — exactly as the method
+    docstring promises: "the returned list contains the original elements
+    verbatim".
 
     Both assertions are required and neither alone suffices. Equality
     alone catches the blunt ``[str(k) for k in all_keys ...]`` mutation
@@ -721,24 +692,22 @@ def test_get_pending_preserves_unsorted_input_order_with_middle_key_completed(tm
     """Surviving keys keep INPUT order, which here is deliberately not sorted order.
 
     Hand derivation — ``mark_completed("games", "0022500002")`` makes
-    ``completed == {"0022500002"}``; the comprehension at
-    ``utils/checkpoint.py`` line 548 walks
+    ``completed == {"0022500002"}``; the filtering comprehension then walks
     ``["0022500003", "0022500002", "0022500001", "0022500004"]`` left to
     right and emits every element whose ``str`` form is absent from
     ``completed``, so the three survivors appear in input order:
     ``["0022500003", "0022500001", "0022500004"]``.
 
-    Deterministically detects a ``sorted(...)`` mutation, which would
-    instead yield ``["0022500001", "0022500003", "0022500004"]``. It also
-    catches the ``set(all_keys)`` mutation whenever that mutant's
-    arbitrary iteration order differs from the input order, though the
-    duplicate-input test above is the deterministic detector for that one.
-
-    The pre-existing Phase 2.6 order test supplies an already-sorted
-    ``["a", "b", "c", "d"]``, so its expected ``["a", "c", "d"]`` is
-    indistinguishable from a sorted result; the unsorted input used here
-    is what makes the order guarantee genuinely falsifiable, and it is
-    what protects the pipelines' chronological ``GAME_ID`` fetch order.
+    The input is deliberately UNSORTED, and that is what makes the order
+    guarantee falsifiable at all: for an already-sorted input the expected
+    list would be indistinguishable from a sorted result. Here a
+    ``sorted(...)`` mutation yields ``["0022500001", "0022500003",
+    "0022500004"]`` instead and is detected deterministically. The same
+    assertion also catches the ``set(all_keys)`` mutation whenever that
+    mutant's arbitrary iteration order differs from the input order, though
+    the duplicate-input test above is the deterministic detector for that
+    one. Input order is what protects the pipelines' chronological
+    ``GAME_ID`` fetch sequence.
     """
     # Arrange — mark ONE key sitting in the middle of the input sequence.
     cp = CheckpointManager(path=tmp_path / "cp.json")
