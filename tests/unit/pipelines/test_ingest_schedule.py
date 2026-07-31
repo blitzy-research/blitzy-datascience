@@ -124,10 +124,12 @@ EXPECTED_SCHEDULE_COLUMNS = [
 #: Rows written for a payload whose table carries ``headers`` but an empty
 #: ``rowSet``.
 #:
-#: ``sample_empty_payload`` supplies ``"rowSet": []``, so the normalizer
-#: returns ``pd.DataFrame(columns=headers)`` — column names preserved, zero
-#: records. len(df) is therefore 0, which is both the ``rows`` the writer
-#: records and the ``n`` the row-count counter receives.
+#: ``sample_empty_payload`` supplies ``"rowSet": []``, so that result set
+#: normalizes to a zero-row DataFrame — column names preserved, zero records
+#: — inside the ``Dict[str, DataFrame]`` mapping ``normalize_result_sets``
+#: returns, and ``_select_primary_df`` selects it. len(df) is therefore 0,
+#: which is both the ``rows`` the writer records and the ``n`` the row-count
+#: counter receives.
 EXPECTED_EMPTY_ROWS = 0
 
 #: Exact ordered column list for the empty-``rowSet`` case.
@@ -425,26 +427,32 @@ def test_run_writes_exact_row_count_and_metric_value_without_dedupe(
 ):
     """``run`` hands the writer all 5 fixture rows and emits ``n=5`` verbatim.
 
-    This SUPPLEMENTS — it never replaces — Test 1, whose happy-path checks
-    stop at ``rows > 0`` and at the *call count* of the row-written counter.
-    Neither of those shapes can see a wrong number, so the suite is currently
-    green but blind to the values themselves. This test pins the numbers.
+    The row count and the counter value are asserted as exact integers rather
+    than as presence or positivity, because "a write happened" and "the count
+    is above zero" cannot distinguish the correct quantity from a wrong one.
+    The distinct-``GAME_ID`` count is asserted alongside the row count: only
+    the pair ``5 rows over 3 games`` pins the documented no-dedupe contract,
+    since either number alone is ambiguous.
 
     Mutations detected
     ------------------
-    * A ``drop_duplicates()`` — or ``drop_duplicates(subset=["GAME_ID"])`` —
-      inserted anywhere between ``normalize_result_sets`` and
-      ``writer.write`` would collapse the 5 legitimate one-row-per-team
-      records down to 3, breaking the documented no-dedupe contract. Every
-      pre-existing assertion in this module passes under that mutation.
+    * A ``drop_duplicates(subset=["GAME_ID"])`` inserted anywhere between
+      ``normalize_result_sets`` and ``writer.write`` collapses the 5
+      legitimate one-row-per-team records down to 3 while leaving the
+      distinct count at 3, breaking the documented no-dedupe contract; the
+      row-count and ``n=`` assertions catch it. (A bare ``drop_duplicates()``
+      would not collapse anything here — all five fixture rows differ by
+      ``TEAM_ID`` — so the key-subset form is the mutation that matters.)
     * Any silently dropped or duplicated row (``.head()``, ``.iloc[1:]``, a
       stray ``concat``) fails the row-count and ``n=`` assertions together.
     * Emitting the wrong quantity into ``pipeline_rows_written_total`` — a
       constant ``1``, or a distinct-key count instead of a row count — fails
-      the ``n=`` assertion while still satisfying Test 1's call-count check.
-    * Relabelling the counter fails the label assertion, which would
-      otherwise silently break every operator dashboard querying
-      ``pipeline="ingest_schedule"``.
+      the ``n=`` assertion even though the counter still fires exactly once.
+    * Renaming the counter itself empties the filtered call list, so the
+      call-count assertion fails first. Changing the label KEYS or VALUES
+      while keeping the counter name is what the label assertion catches —
+      the failure mode that would silently break every operator dashboard
+      querying ``pipeline="ingest_schedule"``.
     * A "fix" to ``_ensure_season_column`` that suppressed the insertion when
       only ``SEASON_ID`` is present, appended ``season`` last instead of at
       index 0, or renamed ``SEASON_ID``, fails the ordered column-list
@@ -543,19 +551,23 @@ def test_run_writes_header_only_artifact_and_marks_checkpoint_for_empty_rowset(
 ):
     """A zero-row upstream payload must still write, still mark, still count.
 
-    ``sample_empty_payload`` carries ``headers`` but ``"rowSet": []``, so
-    :mod:`utils.schema_normalizer` returns ``pd.DataFrame(columns=headers)``
-    — column names preserved, zero records. The pipeline must NOT treat that
-    as "nothing to do": the zero flows all the way through to the metric
-    rather than short-circuiting at any of the three stages. Operators depend
-    on that, because a slow day with no games must still refresh the artifact
+    ``sample_empty_payload`` carries ``headers`` but ``"rowSet": []``, so that
+    result set normalizes to a zero-row DataFrame — column names preserved,
+    zero records — inside the ``Dict[str, DataFrame]`` mapping
+    :func:`utils.schema_normalizer.normalize_result_sets` returns, and
+    ``_select_primary_df`` selects it. The pipeline must NOT treat that as
+    "nothing to do": the zero flows all the way through to the metric rather
+    than short-circuiting at any of the three stages. Operators depend on
+    that, because a slow day with no games must still refresh the artifact
     instead of leaving yesterday's rows on disk looking current.
 
     This is also the empty-input analogue of an aggregation zero-divisor
-    boundary. There is no literal divisor in this codebase — no division,
-    ``mean``, ``groupby`` aggregation or ``agg`` call exists in the
-    production tree — so the degenerate-count case is the faithful stand-in:
-    the place where a count reaching zero really does change behavior.
+    boundary. No arithmetic division, ``mean``, ``groupby`` aggregation or
+    ``agg`` calculation exists in the production tree that could produce a
+    zero-game denominator — the only ``/`` operators there compose
+    :class:`pathlib.Path` values — so the degenerate-count case is the
+    faithful stand-in: the place where a count reaching zero really does
+    change behavior.
 
     Mutations detected
     ------------------
@@ -633,6 +645,20 @@ def test_run_writes_header_only_artifact_and_marks_checkpoint_for_empty_rowset(
         "rather than being short-circuited away; got "
         f"n={row_incs[0].kwargs['n']!r}"
     )
+    # The label mapping is passed POSITIONALLY as args[1], so the complete
+    # dictionary is comparable. Asserting the whole mapping — not merely the
+    # counter name — is what makes the empty path's emission attributable:
+    # an operator dashboard filtering on
+    # pipeline="ingest_schedule", artifact="schedule.csv" must still see the
+    # zero. A mutation that relabelled the empty-path increment (a distinct
+    # "empty" artifact name, a dropped label, or the legacy domain/file
+    # label names) would silently strand it outside every existing query
+    # while the n=0 assertion above still passed.
+    assert row_incs[0].args[1] == EXPECTED_ROW_COUNT_LABELS, (
+        "the header-only write must be counted under the very same label set "
+        f"as a non-empty write, {EXPECTED_ROW_COUNT_LABELS!r}; got "
+        f"{row_incs[0].args[1]!r}"
+    )
 
 
 # ===========================================================================
@@ -648,10 +674,9 @@ def test_rule5_write_failure_propagates_and_leaves_checkpoint_unmarked(
 ):
     """When ``writer.write`` raises, ``run`` re-raises and marks nothing.
 
-    Test 3 pins Rule 5 ordering on the SUCCESS path — one probe before the
-    write, one mark after it. This is the missing negative case, and it is
-    the one that actually proves the mark is *downstream of a successful
-    write* rather than merely sequenced after it when nothing goes wrong.
+    Rule 5 requires that ``mark_completed`` run only *downstream of a
+    successful write*, so a failing write must leave the checkpoint entirely
+    unmarked and the next run must retry the same key.
     ``RecordingWriter(raise_on=...)`` raises
     ``RuntimeError("synthetic write failure for 'schedule'")`` instead of
     recording, and because Rule 6 fail-safe wrapping is scoped exclusively to
@@ -664,22 +689,36 @@ def test_rule5_write_failure_propagates_and_leaves_checkpoint_unmarked(
       pipeline would checkpoint work that was never persisted, and every
       resumed run would then skip that season forever while producing no
       artifact at all — the worst possible silent failure for this system.
-    * Wrapping the write in ``try/except Exception: pass`` (Rule 6's
-      per-game guard misapplied to a single-shot pipeline): the failure
-      would be swallowed, the CLI would report success, and ``pytest.raises``
-      would report that no exception was raised.
+    * Swallowing the write failure and returning normally (Rule 6's per-game
+      guard misapplied to a single-shot pipeline — catching the exception and
+      returning before the counter and the checkpoint mark): the caller would
+      see a clean return instead of the failure, and ``pytest.raises`` would
+      report that no exception was raised.
     * Recording a write record despite the failure — caught by the empty
       ``writer.writes`` assertion, which is what ties "nothing persisted" to
       "nothing checkpointed".
+    * Hoisting ``met.inc("pipeline_rows_written_total", ...)`` ABOVE
+      ``writer.write``: the counter would report rows as persisted for a
+      write that never happened, so ``pipeline_rows_written_total`` would
+      drift permanently above the rows actually on disk and every
+      operator dashboard built on it would over-report. The exception,
+      writer and checkpoint assertions all still pass under that mutation
+      — only an injected metrics sink can see it, which is why one is
+      supplied here even though the failure path emits nothing.
     """
     # --- Arrange -------------------------------------------------------
-    # ``raise_on`` MUST be passed by keyword. The factory's single
-    # parameter IS ``raise_on``, so any positional argument would arm the
-    # spy with the wrong artifact name and the write would silently
-    # succeed, quietly turning this negative test into a no-op.
+    # ``raise_on`` is passed by keyword so the armed artifact is explicit at
+    # the call site and cannot be misbound should the factory ever grow a
+    # second parameter. It must equal the artifact name the pipeline writes,
+    # otherwise the write succeeds and this negative test becomes a no-op.
     client = recording_client(responses={_ENDPOINT_LABEL: sample_schedule_payload})
     writer = recording_writer(raise_on=config.CSV_SCHEDULE)
     checkpoint = recording_checkpoint()
+    # An explicit sink is injected on the FAILURE path precisely because the
+    # expected emission count is zero: without it ``run`` would fall back to
+    # the real module-level registry and the metric leg of Rule 5 would go
+    # unobserved, leaving the write-then-count ordering untested.
+    metrics_mock = MagicMock()
 
     # --- Act -----------------------------------------------------------
     with pytest.raises(RuntimeError) as excinfo:
@@ -688,6 +727,7 @@ def test_rule5_write_failure_propagates_and_leaves_checkpoint_unmarked(
             writer=writer,
             checkpoint=checkpoint,
             season=_SEASON,
+            metrics=metrics_mock,
         )
 
     # --- Assert: the writer's own failure is what escaped ---------------
@@ -708,4 +748,33 @@ def test_rule5_write_failure_propagates_and_leaves_checkpoint_unmarked(
         "mark_completed MUST NOT run when the write failed, otherwise a "
         "resumed run would permanently skip work that was never persisted; "
         f"observed marks={checkpoint.marks!r}"
+    )
+
+    # --- Assert: nothing was counted as written ------------------------
+    # The row-written counter is emitted from a single production call site
+    # that sits strictly BETWEEN the write and the mark, so a write that
+    # raised must leave the series completely empty — zero emissions, not a
+    # zero-valued one. This is the metric-side twin of the marks assertion
+    # above: "nothing persisted" must also mean "nothing reported".
+    row_incs = [
+        c
+        for c in metrics_mock.inc.call_args_list
+        if c.args and c.args[0] == "pipeline_rows_written_total"
+    ]
+    assert row_incs == [], (
+        "a failed write must produce ZERO pipeline_rows_written_total "
+        "emissions — the counter sits after writer.write, so any emission "
+        "here means rows were reported as persisted that never reached "
+        f"disk; observed {len(row_incs)} increment(s): {row_incs!r}"
+    )
+    # ``pipeline_rows_written_total`` is the ONLY counter this pipeline
+    # emits, and its single call site is downstream of the write, so the
+    # sink must be untouched in its entirety. Asserting the whole call list
+    # — rather than only the name-filtered slice — additionally catches a
+    # mutation that renamed the counter while keeping the premature
+    # emission, which the filtered assertion above would silently miss.
+    assert metrics_mock.inc.call_args_list == [], (
+        "the schedule pipeline emits exactly one counter and it is "
+        "downstream of the write, so a failed write must leave the metrics "
+        f"sink entirely untouched; observed {metrics_mock.inc.call_args_list!r}"
     )

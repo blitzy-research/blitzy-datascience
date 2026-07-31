@@ -1,7 +1,8 @@
 """Retry-classification contract for ``api.nba_client`` -- the transport stage.
 
-Four behaviours decide whether a failed HTTPS GET is retried and how the
-resulting terminal failure is labelled. This module pins all four:
+Five behaviours decide whether a failed HTTPS GET is retried, how the resulting
+terminal failure is labelled, and where the evidence of it is written. This
+module pins all five:
 
 1. The **truth table** of ``api.nba_client._is_transient``: ten rows covering
    all six of its branches -- the transport tuple, ``HTTPError`` at 429, at or
@@ -15,6 +16,10 @@ resulting terminal failure is labelled. This module pins all four:
    HTTP attempt, not ``config.RETRY_ATTEMPTS`` of them.
 4. The **``http_5xx`` and ``http_4xx_non_429`` reason labels** carried by
    ``nba_request_failures_total``.
+5. The **destination and schema of the failure log records**: one WARNING per
+   retry plus one ERROR per exhausted request, each carrying the exact fields of
+   its production format string, and all of them written to a ``tmp_path`` file
+   rather than appended to the operator's durable ``logs/pipeline.log``.
 
 Why the predicate exists
 ------------------------
@@ -54,11 +59,19 @@ objects*, so production ``isinstance`` checks behave identically. The shared
 autouse fixtures reset the correlation id, the metrics registry and the logger
 handlers around every test, so each counter delta starts from zero and each test
 passes alone, in this module, and in the full suite in any order.
+
+Isolation extends to the durable log sink, which handler resetting alone cannot
+provide: the ``client`` fixture depends on ``tmp_log_dir`` so ``config.LOG_FILE``
+is already redirected into ``tmp_path`` when the first ``get_logger`` call
+configures logging. Fabricated 500s and 404s therefore leave no trace in the
+operator's ``logs/pipeline.log`` and cause none of its rotation.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock
 
 import pytest
@@ -116,6 +129,39 @@ STATUS_LAST_NON_5XX = 499
 STATUS_BAD_REQUEST = 400
 STATUS_NOT_FOUND = 404
 
+# Logging destination and schema. The transport layer has TWO writers on the
+# failure path and both resolve the same logger name: the instance logger built
+# in ``NBAClient.__init__`` and the one ``_retry_log_before_sleep`` acquires for
+# itself. ``config.LOG_FORMAT`` --
+# ``"%(asctime)s %(levelname)s corr=%(correlation_id)s %(name)s %(message)s"``
+# -- renders that name as the fourth whitespace-delimited field of every line,
+# which is what makes the parser below able to select exactly these records.
+LOGGER_NAME = "nba_client"
+LEVEL_WARNING = "WARNING"
+LEVEL_ERROR = "ERROR"
+
+# The two format strings those writers use, transcribed from the production
+# source (api/nba_client.py: ``_retry_log_before_sleep`` and the
+# ``except RequestException`` block of ``NBAClient.get``) rather than captured
+# from a run. ``%``-formatting them here reproduces exactly what ``logging``
+# does when it renders the record.
+RETRY_LOG_TEMPLATE = (
+    "NBAClient retrying endpoint=%s attempt=%s exc_class=%s status=%s"
+)
+EXHAUSTION_LOG_TEMPLATE = (
+    "NBAClient request exhausted retries endpoint=%s reason=%s"
+)
+
+# ``type(exc).__name__`` for the error ``_make_response`` attaches to
+# ``raise_for_status``, i.e. the ``HTTPError`` imported at the top of this
+# module.
+EXPECTED_EXC_CLASS = "HTTPError"
+
+# The directory and file names ``tests/conftest.py::tmp_log_dir`` creates under
+# ``tmp_path`` and points ``config.LOG_DIR`` / ``config.LOG_FILE`` at.
+TMP_LOG_DIR_NAME = "logs"
+TMP_LOG_FILE_NAME = "pipeline.log"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -169,6 +215,26 @@ def _http_error_with_status(status_code: int) -> HTTPError:
     return error
 
 
+def _nba_client_log_records(log_text: str) -> List[Tuple[str, str]]:
+    """Return the ``(levelname, message)`` of each ``nba_client`` record, in order.
+
+    ``config.LOG_FORMAT`` is
+    ``"%(asctime)s %(levelname)s corr=%(correlation_id)s %(name)s %(message)s"``
+    and none of the first four fields can contain a space --
+    ``config.LOG_DATE_FORMAT`` is ``"%Y-%m-%dT%H:%M:%S"``, the level and logger
+    names are single tokens and the correlation id is a hex token -- so a
+    four-way split isolates the message exactly. Records emitted by any other
+    logger are dropped, so the returned list is the transport layer's own
+    output and can be compared for full equality.
+    """
+    records: List[Tuple[str, str]] = []
+    for line in log_text.splitlines():
+        fields = line.split(" ", 4)
+        if len(fields) == 5 and fields[3] == LOGGER_NAME:
+            records.append((fields[1], fields[4]))
+    return records
+
+
 def _failure_count(reason: str) -> float:
     """Read ``nba_request_failures_total`` for ``ENDPOINT`` and ``reason``.
 
@@ -220,12 +286,39 @@ def mock_rate_limiter() -> MagicMock:
 
 
 @pytest.fixture
-def client(mock_rate_limiter: MagicMock) -> NBAClient:
-    """Default NBAClient with an injected mocked rate_limiter.
+def client(mock_rate_limiter: MagicMock, tmp_log_dir: Path) -> NBAClient:
+    """Default NBAClient with an injected mocked rate_limiter, logging to tmp.
 
     ``NBAClient.__init__`` is keyword-only, so the collaborator is passed by
-    name. Logger and metrics default to the production singletons, which the
-    autouse fixtures in ``conftest.py`` reset between tests.
+    name. Metrics default to the production singleton, which the autouse
+    fixtures in ``conftest.py`` reset between tests.
+
+    Why ``tmp_log_dir`` is a dependency of this fixture
+    ---------------------------------------------------
+    Every retry driven below is a *synthetic* upstream failure, and each one
+    makes the transport layer emit a real WARNING (per retry) and a real ERROR
+    (on exhaustion). ``utils.logger._configure`` attaches a
+    ``RotatingFileHandler`` bound to ``config.LOG_FILE``, so without a redirect
+    those synthetic records would be appended to the operator's own
+    ``logs/pipeline.log`` -- polluting a durable forensic artifact with
+    fabricated incidents and driving avoidable rotation of it. The autouse
+    ``_reset_logger_handlers_between_tests`` fixture detaches handlers around
+    each test but does NOT relocate the sink, so it cannot prevent that on its
+    own. ``tmp_log_dir`` monkeypatches ``config.LOG_DIR`` and ``config.LOG_FILE``
+    to ``tmp_path``; because pytest builds a fixture's dependencies BEFORE its
+    body runs, the redirect is in place before ``NBAClient(...)`` triggers the
+    first ``get_logger`` call, and the reset fixture's ``_configured = False``
+    guarantees ``_configure`` re-runs against the temporary path.
+
+    Injecting a per-instance ``logger=`` would NOT be sufficient: the tenacity
+    ``before_sleep`` callback ``api.nba_client._retry_log_before_sleep`` is a
+    module-level function with no access to ``self``, so it calls
+    ``get_logger("nba_client")`` itself and would resolve the production sink
+    regardless of what this instance holds. Redirecting the configured
+    destination is therefore the only fix that covers both writers.
+    ``test_retry_logging_is_confined_to_the_temporary_log_file`` pins this, so
+    dropping the dependency fails the module rather than silently resuming the
+    pollution.
     """
     return NBAClient(rate_limiter=mock_rate_limiter)
 
@@ -609,4 +702,114 @@ def test_retries_counter_increments_once_per_retry_on_500_exhaustion(
         f"{RETRIES_COUNTER}{{endpoint={ENDPOINT!r}}} must equal "
         f"config.RETRY_ATTEMPTS - 1 = {expected_retries} (one before_sleep "
         f"per retry, none before the first attempt); got {observed_retries!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Log-destination isolation
+# ---------------------------------------------------------------------------
+
+
+def test_retry_logging_is_confined_to_the_temporary_log_file(
+    client: NBAClient,
+    fast_tenacity_sleep: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every synthetic retry record lands in tmp_path, not in the real log file.
+
+    The retries driven throughout this module are fabricated upstream failures,
+    and each one makes the transport layer emit durable records: a WARNING per
+    retry from ``_retry_log_before_sleep`` and an ERROR per exhausted request
+    from ``NBAClient.get``. ``utils.logger._configure`` binds a
+    ``RotatingFileHandler`` to ``config.LOG_FILE``, so unless that destination is
+    redirected those records are appended to the operator's own
+    ``logs/pipeline.log`` -- a durable forensic artifact that would then contain
+    invented incidents and be rotated for no operational reason. The ``client``
+    fixture prevents this by depending on ``tmp_log_dir``; this test is what
+    makes that dependency enforced rather than merely intended.
+
+    Mutation detected: dropping ``tmp_log_dir`` from the ``client`` fixture --
+    ``config.LOG_FILE`` reverts to the production path, which assertion (1)
+    reports directly; assertions (2) and (3) independently encode the same
+    property, one on the attached handler and one on the file contents.
+    Assertion (3) additionally catches a renamed field in either format string,
+    a changed level, and a retry WARNING emitted after the final attempt,
+    because it compares the complete ordered record list rather than a
+    substring.
+    """
+    # Arrange -- the destination is derived from the fixture chain rather than
+    # read back from the code under test: tmp_log_dir creates
+    # ``tmp_path / "logs"`` and repoints config.LOG_DIR / config.LOG_FILE at it.
+    expected_log_file = tmp_path / TMP_LOG_DIR_NAME / TMP_LOG_FILE_NAME
+    mock_get = MagicMock(return_value=_make_response(STATUS_SERVER_ERROR))
+    monkeypatch.setattr(client._session, "get", mock_get)
+
+    # Hand-derived from the two production format strings. ``before_sleep`` runs
+    # after every failed attempt except the last, and ``attempt_number`` is the
+    # number of the attempt that just failed, so the WARNING attempt numbers are
+    # 1 .. config.RETRY_ATTEMPTS - 1 (1, 2, 3, 4 at the shipped value of 5).
+    # The single ERROR follows from get()'s ``except RequestException`` block
+    # once the budget is spent, labelled ``http_5xx`` because 500 >= 500.
+    expected_records: List[Tuple[str, str]] = [
+        (
+            LEVEL_WARNING,
+            RETRY_LOG_TEMPLATE
+            % (ENDPOINT, attempt, EXPECTED_EXC_CLASS, STATUS_SERVER_ERROR),
+        )
+        for attempt in range(1, config.RETRY_ATTEMPTS)
+    ]
+    expected_records.append(
+        (LEVEL_ERROR, EXHAUSTION_LOG_TEMPLATE % (ENDPOINT, REASON_HTTP_5XX))
+    )
+
+    # Act
+    with pytest.raises(HTTPError):
+        client.get(ENDPOINT, {})
+
+    # Assert (0) -- the retry budget really was spent, so the record list below
+    # is compared against a fully exercised failure rather than a short one.
+    assert mock_get.call_count == config.RETRY_ATTEMPTS, (
+        f"this test only observes the full logging sequence when every attempt "
+        f"is spent: expected config.RETRY_ATTEMPTS={config.RETRY_ATTEMPTS} "
+        f"attempts, got {mock_get.call_count}"
+    )
+
+    # Assert (1) -- the configured sink is the temporary one.
+    assert config.LOG_FILE == expected_log_file, (
+        f"config.LOG_FILE must be redirected into tmp_path before the client "
+        f"is built (the ``client`` fixture depends on tmp_log_dir for exactly "
+        f"this reason); expected {expected_log_file}, got {config.LOG_FILE}"
+    )
+
+    # Assert (2) -- and no durable handler writes anywhere else. Exactly one
+    # RotatingFileHandler is attached by ``utils.logger._configure``; the
+    # console StreamHandler it also attaches is not a FileHandler and pytest's
+    # own capture handlers are not either, so this list is the complete set of
+    # files the logging tree can touch. (An explicit ``--log-file`` invocation
+    # would legitimately add one and is not part of the project's run command.)
+    file_destinations = [
+        handler.baseFilename
+        for handler in logging.getLogger().handlers
+        if isinstance(handler, logging.FileHandler)
+    ]
+    assert file_destinations == [str(expected_log_file)], (
+        f"the only durable log sink during this test must be "
+        f"{str(expected_log_file)!r}; got {file_destinations!r} -- any other "
+        f"entry is a real file being written by synthetic failures"
+    )
+
+    # Assert (3) -- and that file holds exactly the expected sequence, proving
+    # BOTH writers were redirected: the module-level before_sleep callback
+    # (which resolves its own logger, so a per-instance ``logger=`` injection
+    # could not have covered it) and the instance logger inside get().
+    observed_records = _nba_client_log_records(
+        expected_log_file.read_text(encoding="utf-8")
+    )
+    assert observed_records == expected_records, (
+        f"the temporary log must hold config.RETRY_ATTEMPTS - 1 = "
+        f"{config.RETRY_ATTEMPTS - 1} retry WARNINGs followed by one "
+        f"exhaustion ERROR, with the exact field names and values of the "
+        f"production format strings; expected {expected_records!r}, got "
+        f"{observed_records!r}"
     )

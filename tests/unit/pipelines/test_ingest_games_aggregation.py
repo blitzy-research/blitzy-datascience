@@ -21,66 +21,80 @@ lines 794-799), then increments ``pipeline_rows_written_total`` with the
   distribution ``[2, 3, 2]``, its distinct game/player counts ``3``/``4``,
   its shape ``(7, 5)``, and its exact ordered column list
   ``['season', 'GAME_ID', 'PLAYER_ID', 'TEAM_ID', 'PTS']``;
+* the complete ``(labels, n)`` ownership of every row-written emission, so
+  a swapped or malformed games/play-by-play label pair cannot hide behind a
+  correct value sequence;
 * one ordered ``checkpoint.mark_completed`` per game and exactly one
   ``get_pending`` probe carrying the full enumerated tuple;
 * the zero-enumerated-games short circuit -- no write, no mark, no metric
-  increment, and no upstream fetch;
+  increment, no upstream fetch, and **no prior-session buffer load**:
+  neither ``_load_existing_games`` nor ``_load_existing_pbp`` is reached,
+  so an all-checkpointed run performs no artifact stat and no
+  :func:`pandas.read_csv`. Its positive control proves each loader *does*
+  run exactly once, with the writer's output directory and the full
+  pending list, as soon as a game is pending;
 * the degenerate-frame boundary -- a zero-row payload still produces a
-  write, still checkpoints, still increments the counter with ``n=0``, and
-  is **not** swallowed by the Rule 6 handler.
+  write, still checkpoints, still increments the counter with ``n=0`` under
+  its own artifact label, and is **not** swallowed by the Rule 6 handler.
 
 Two of those contracts are observable only in the log stream, so a
 handwritten :class:`logging.LoggerAdapter` spy is injected alongside the
 collaborator spies: the *terminal event* that proves the zero-game run
 took the skip branch (see :class:`_LoggerSpy` for why the collaborator
 spies cannot see it), and the per-game ``box_rows`` / ``pbp_rows`` event
-that independently witnesses the counts the row counter reports.
+that independently witnesses the counts the row counter reports. Both are
+compared as complete ``(format string, args)`` records, so the
+operator-facing field NAMES are pinned alongside their values -- an
+args-only comparison would accept a renamed or re-shaped event.
+
+One contract is observable only through the *absence* of work, so the two
+prior-session buffer loaders are replaced with recording spies (see
+:class:`_BufferLoaderSpy`): hoisting either above the ``if not pending:``
+guard is a pure performance regression that leaves every write, mark,
+metric and log record unchanged.
 
 Why a separate sibling module
 -----------------------------
-``tests/unit/pipelines/test_ingest_games.py`` is ~1,800 lines across nine
-tests and houses the mandatory Rule 6 canary suite. Its aggregation
-assertions are frozen (see below), so the sensitivity this module adds
-cannot be delivered by editing them. A focused sibling keeps one concern
-reviewable in isolation and is collected automatically because
-``pytest.ini`` sets ``python_files = test_*.py``.
+``tests/unit/pipelines/test_ingest_games.py`` owns the Rule 6 canary
+suite and checks the aggregation with shapes that constrain direction and
+sign rather than exact values (see below). This module carries the
+value-exact assertions instead, so each concern stays reviewable on its
+own. A sibling module is collected automatically because ``pytest.ini``
+sets ``python_files = test_*.py``.
 
-The verified gap this module closes
------------------------------------
-The pre-existing happy-path test validates the aggregation with two
-assertion shapes that a plausible bug survives:
+The assertion shapes this module strengthens
+--------------------------------------------
+The happy-path test in ``test_ingest_games.py`` checks the aggregation
+with two shapes that a plausible bug can satisfy:
 
-1. a **monotonicity** check, ``assert w["rows"] >= prev_games_rows``
-   (``test_ingest_games.py`` lines 393-406); and
-2. a **presence-and-positivity** check, ``assert "n" in c.kwargs``
-   followed by ``assert c.kwargs["n"] > 0`` (lines 469-476).
+1. a **monotonicity** check on the cumulative write sizes,
+   ``assert w["rows"] >= prev_games_rows``; and
+2. a **presence-and-positivity** check on the row counter,
+   ``assert "n" in c.kwargs`` followed by ``assert c.kwargs["n"] > 0``.
 
-Both hold under a mutation that replaces the cumulative
-``pd.concat(buffer, ...)`` with "write only the latest frame", and both
-hold under a mutation that emits ``len(combined_games)`` instead of
-``len(bs_df)``. They are blind because the fixtures those tests use
-deliver **equal** per-game counts (2 box-score and 3 play-by-play rows
-for every game), which makes the correct and the mutated sequences
-numerically indistinguishable.
-
-Both mutations were applied to a scratch copy of the pipeline to confirm
-the gap rather than assume it. The "cumulative counts" mutation survives
-the **entire** pre-existing offline suite. The "latest frame only"
-mutation survives the pre-existing happy-path test as described, and is
-caught elsewhere only incidentally -- by the *resume* test, whose
-history-preservation assertions it also breaks. This module closes both
-directly, in the aggregation path itself.
+Neither shape can separate the correct implementation from a mutation
+that replaces the cumulative ``pd.concat(buffer, ...)`` with "write only
+the latest frame", nor from one that emits ``len(combined_games)``
+instead of ``len(bs_df)``, when every game contributes the same number
+of rows: the fixtures that test uses deliver **equal** per-game counts
+(2 box-score and 3 play-by-play rows per game), so the latest-frame
+sequence is flat and still non-decreasing, and every positive ``n=``
+looks alike whether it is a per-game delta or a running total. This
+module asserts the sequences themselves, in the aggregation path.
 
 Why the per-game row counts are deliberately unequal
 ----------------------------------------------------
 The canonical mini-season fixture contributes **2 / 3 / 2** box-score
-rows and **4 / 1 / 3** play-by-play rows. That asymmetry is the whole
-point: with unequal counts every cumulative size is unique, so
-"write only the latest frame" yields ``[2, 3, 2]`` / ``[4, 1, 3]``
-instead of ``[2, 5, 7]`` / ``[4, 5, 8]``, and emitting cumulative
-lengths yields ``[2, 4, 5, 5, 7, 8]`` instead of ``[2, 4, 3, 1, 2, 3]``.
-Every wrong implementation produces a different, immediately visible
-sequence. The counts must not be normalised, equalised, or reordered.
+rows and **4 / 1 / 3** play-by-play rows. That asymmetry is what makes
+the two mutations above observable: "write only the latest frame" yields
+``[2, 3, 2]`` / ``[4, 1, 3]`` rather than the running totals
+``[2, 5, 7]`` / ``[4, 5, 8]``, and emitting cumulative lengths yields
+``[2, 4, 5, 5, 7, 8]`` rather than the per-game ``[2, 4, 3, 1, 2, 3]``.
+Because consecutive games contribute different counts, every running
+total is strictly larger than the one before it, so each mutated sequence
+diverges from the correct one from the second write onward -- and the
+latest-frame sequences additionally decrease, which no cumulative
+sequence can. The counts must not be normalised, equalised, or reordered.
 
 The hand-derived arithmetic, in full
 ------------------------------------
@@ -145,23 +159,28 @@ Rule 6 is deliberately NOT re-tested here
 -----------------------------------------
 Per-game failure isolation is already covered by
 ``test_ingest_games.py::TestRule6FailSafe``. This module adds no new
-Rule 6 error case; it only asserts, in the boundary tests, that
-``games_failed_total`` was **never** incremented -- which is what proves
-a degenerate-but-valid payload flowed through the happy path instead of
-being swallowed by the fail-safe handler.
+Rule 6 error case. The boundary tests do additionally assert that
+``games_failed_total`` was **never** incremented: that is negative-space
+evidence, alongside their recorded write, row-increment and
+checkpoint-mark assertions, that a degenerate-but-valid payload flowed
+through the happy path rather than being swallowed by the fail-safe
+handler.
 
 There is no literal "zero-game divisor" in this codebase
 --------------------------------------------------------
-Stated plainly rather than papered over: there is no division, ``mean``,
-``groupby`` aggregation, or ``agg`` call site anywhere in ``api/``,
-``endpoints/``, ``pipelines/``, ``storage/``, ``utils/``, ``config.py``,
-or ``run.py`` -- the only aggregation primitives are the two
-``pd.concat`` calls this module targets. So there is no divisor to drive
-to zero, and none is invented here. The requirement is honoured through
-faithful analogues, of which this module supplies three: the
-zero-enumerated-games short circuit (the loop body never executes),
-cumulative row-count conservation (exactly 7 and 8), and per-game versus
-cumulative counter semantics (the ``[2, 4, 3, 1, 2, 3]`` sequence).
+Stated plainly rather than papered over: no arithmetic division, no
+``mean``, no ``groupby`` aggregation and no ``agg`` call site exists
+anywhere in ``api/``, ``endpoints/``, ``pipelines/``, ``storage/``,
+``utils/``, ``config.py``, or ``run.py``, so no calculation there can
+produce a zero-game denominator. (The ``/`` operator does appear in
+production, but only to compose :class:`pathlib.Path` values.) The only
+aggregation primitives are the two ``pd.concat`` calls this module
+targets. So there is no divisor to drive to zero, and none is invented
+here. The requirement is honoured through faithful analogues, of which
+this module supplies three: the zero-enumerated-games short circuit (the
+loop body never executes), cumulative row-count conservation (exactly 7
+and 8), and per-game versus cumulative counter semantics (the
+``[2, 4, 3, 1, 2, 3]`` sequence).
 """
 
 from __future__ import annotations
@@ -175,7 +194,6 @@ import pytest
 
 import config
 from pipelines import ingest_games
-from tests.conftest import RecordingClient
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +205,8 @@ from tests.conftest import RecordingClient
 _SEASON = "2025-26"
 
 #: Endpoint name for the traditional box score. Appears as ``calls[i][0]``
-#: in :class:`RecordingClient.calls` -- see ``tests/conftest.py``.
+#: in :attr:`_MiniSeasonClient.calls`, the module-local client spy defined
+#: below.
 _BOXSCORE_ENDPOINT = "boxscoretraditionalv2"
 
 #: Endpoint name for the play-by-play endpoint.
@@ -201,14 +220,33 @@ _ROWS_WRITTEN_COUNTER = "pipeline_rows_written_total"
 #: 851). The boundary tests assert it was never incremented.
 _GAMES_FAILED_COUNTER = "games_failed_total"
 
-#: The ``pipeline`` label value both counters carry. The label *names*
+#: The ``pipeline`` label value every ``pipeline_rows_written_total``
+#: increment carries. For that counter the label *names*
 #: (``pipeline``/``artifact``, not ``domain``/``file``) are the documented
-#: operator contract.
+#: operator contract. It does not apply to ``games_failed_total``, which is
+#: emitted with a single-key label set instead -- ``{"reason": <exception
+#: class name>}`` (``pipelines/ingest_games.py`` line 851).
 _PIPELINE_LABEL = "ingest_games"
 
 #: Log-message prefix of the per-game completion event emitted once per
 #: successfully processed game (``pipelines/ingest_games.py`` line 820).
 _GAME_COMPLETE_PREFIX = "pipeline.games.game_complete"
+
+#: The COMPLETE, verbatim format string of that per-game event. The
+#: production call site splits the literal across two source lines
+#: (``pipelines/ingest_games.py`` lines 820-825), which the interpreter
+#: concatenates into exactly the single string reproduced here -- one space
+#: between ``game_id=%s`` and ``box_rows=%d``.
+#:
+#: Comparing the format string itself, and not merely its interpolated
+#: arguments, is what pins the operator-facing FIELD NAMES and the
+#: ``%d``/``%s`` conversion kinds. Renaming ``box_rows`` to ``rows``,
+#: dropping ``pbp_rows``, reordering the fields, or appending misleading
+#: trailing content after the same prefix all leave the positional
+#: arguments identical, so an args-only comparison cannot see any of them.
+_GAME_COMPLETE_FORMAT = (
+    "pipeline.games.game_complete game_id=%s box_rows=%d pbp_rows=%d"
+)
 
 #: Log-message prefix shared by BOTH terminal events -- the skip variant
 #: (line 736) and the processed/failed variant (line 854). Filtering on the
@@ -250,6 +288,23 @@ EXPECTED_GAMES_INCREMENTS = [2, 3, 2]
 
 #: The play-by-play partition of the increment sequence: 4 ; 1 ; 3.
 EXPECTED_PBP_INCREMENTS = [4, 1, 3]
+
+#: The COMPLETE label mapping every games-CSV row-written increment must
+#: carry, transcribed from ``pipelines/ingest_games.py`` lines 802-806. The
+#: label NAMES are ``pipeline``/``artifact`` (not ``domain``/``file``) and
+#: the artifact value is the CSV filename, so it is built from
+#: ``config.CSV_GAMES`` rather than a duplicated literal.
+EXPECTED_GAMES_LABELS = {
+    "pipeline": _PIPELINE_LABEL,
+    "artifact": f"{config.CSV_GAMES}.csv",
+}
+
+#: The COMPLETE label mapping every play-by-play row-written increment must
+#: carry (``pipelines/ingest_games.py`` lines 808-811).
+EXPECTED_PBP_LABELS = {
+    "pipeline": _PIPELINE_LABEL,
+    "artifact": f"{config.CSV_PLAY_BY_PLAY}.csv",
+}
 
 #: Row-count conservation for the box score: 2+3+2 = 7.
 EXPECTED_BOX_ROW_TOTAL = 7
@@ -313,6 +368,24 @@ EXPECTED_HEADER_ONLY_SHAPE = (0, 4)
 #: so the counter must still fire twice, as ``n=0`` then ``n=4``. A
 #: mutation that skipped the counter for an empty frame would yield [4].
 EXPECTED_BOUNDARY_INCREMENTS = [0, 4]
+
+#: The same two boundary emissions as COMPLETE ordered ``(labels, n)``
+#: pairs: the games artifact owns the ``0`` and the play-by-play artifact
+#: owns the ``4``. Derivation: the degenerate box score contributes 0 rows
+#: (``EXPECTED_BOUNDARY_INCREMENTS[0]``) and G1's play-by-play contributes
+#: 4 (``EXPECTED_PBP_INCREMENTS[0]``), emitted games-then-pbp within the
+#: single iteration.
+#:
+#: The values alone cannot prove ARTIFACT OWNERSHIP: swapping the two
+#: label mappings leaves the ``[0, 4]`` value sequence intact while
+#: reporting the empty box score against ``play_by_play.csv`` and the four
+#: play-by-play events against ``games.csv`` -- so every per-artifact
+#: operator dashboard would silently invert. Pairing each value with its
+#: full label mapping, in emission order, is what closes that.
+EXPECTED_BOUNDARY_EMISSIONS = [
+    (EXPECTED_GAMES_LABELS, EXPECTED_BOUNDARY_INCREMENTS[0]),
+    (EXPECTED_PBP_LABELS, EXPECTED_BOUNDARY_INCREMENTS[1]),
+]
 
 #: The ordered ``(box_rows, pbp_rows)`` pairs the pipeline logs once per
 #: completed game: (2,4), (3,1), (2,3). This is an INDEPENDENT witness of
@@ -441,6 +514,31 @@ def _row_written_increments(
     return [c.kwargs["n"] for c in calls]
 
 
+def _row_written_emissions(
+    metrics_mock: MagicMock,
+) -> List[Tuple[Optional[Dict[str, str]], Optional[int]]]:
+    """Ordered ``(labels, n)`` pairs of every row-written increment.
+
+    The complement of :func:`_row_written_increments`: instead of
+    discarding the label mapping to compare values, each value is returned
+    still attached to the COMPLETE mapping it was emitted with, in emission
+    order. That is what makes artifact ownership assertable -- swapping the
+    two label mappings leaves the value sequence untouched, so only the
+    paired form can detect it.
+
+    ``None`` is substituted for a missing label mapping or a missing ``n``
+    keyword rather than raising, so a mutation that passed the labels by
+    keyword or dropped the increment surfaces as a readable mismatch in the
+    caller's assertion message instead of as an ``IndexError`` or
+    ``KeyError`` from inside this helper.
+    """
+    emissions: List[Tuple[Optional[Dict[str, str]], Optional[int]]] = []
+    for call in _counter_calls(metrics_mock, _ROWS_WRITTEN_COUNTER):
+        labels = call.args[1] if len(call.args) > 1 else None
+        emissions.append((labels, call.kwargs.get("n")))
+    return emissions
+
+
 def _zero_row_boxscore_payload(
     game_id: str,
     headers: List[str],
@@ -476,6 +574,77 @@ def _zero_row_boxscore_payload(
             }
         ],
     }
+
+
+class _BufferLoaderSpy:
+    """Handwritten recording stand-in for a prior-session buffer loader.
+
+    ``ingest_games.run`` seeds its two in-memory buffers by calling
+    ``_load_existing_games`` and ``_load_existing_pbp`` (``pipelines/
+    ingest_games.py`` lines 759-765) -- and it does so *after* the
+    ``if not pending:`` short circuit at line 735. Each helper performs a
+    ``Path.is_file()`` probe and, when the artifact exists, a full
+    :func:`pandas.read_csv` of a file that grows to a whole season of box
+    scores and play-by-play events. On an all-checkpointed run that work is
+    pure waste, which is exactly why the guard precedes it.
+
+    Nothing observable to the collaborator spies changes if that ordering
+    is inverted: with an empty pending list the loop body does not execute
+    either way, so writes, marks, metrics and even the terminal log event
+    stay identical while every run silently pays for two file probes and
+    two potentially large CSV parses. Recording the invocations is
+    therefore the only way to pin the guard's PERFORMANCE contract.
+
+    Returning ``[]`` reproduces the real behaviour under
+    ``RecordingWriter`` faithfully: that spy creates its ``output_dir`` but
+    writes no CSV, so both production helpers take their
+    ``if not path.is_file(): return []`` branch. Substituting this spy
+    therefore leaves every cumulative row count in this module unchanged.
+
+    A handwritten callable class is used rather than a
+    :class:`~unittest.mock.MagicMock` so the production call signature is
+    enforced positionally at call time -- a renamed or reordered loader
+    parameter surfaces as a ``TypeError`` here instead of being absorbed by
+    attribute-access magic.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.calls: List[Tuple[Any, str, Tuple[str, ...]]] = []
+
+    def __call__(
+        self,
+        output_dir: Any,
+        season: str,
+        pending_ids: Iterable[str],
+        log: Any,
+    ) -> List[pd.DataFrame]:
+        """Record ``(output_dir, season, pending_ids)`` and seed nothing."""
+        self.calls.append((output_dir, str(season), tuple(pending_ids)))
+        return []
+
+
+def _patch_buffer_loaders(
+    monkeypatch: pytest.MonkeyPatch,
+    games_loader: _BufferLoaderSpy,
+    pbp_loader: _BufferLoaderSpy,
+) -> None:
+    """Install both :class:`_BufferLoaderSpy` instances on the pipeline.
+
+    The patch targets are the names in the *pipeline's* namespace, which is
+    also where they are defined, so ``monkeypatch.setattr``'s default
+    ``raising=True`` guarantees a typo cannot silently produce a vacuously
+    passing "was never called" assertion: a wrong attribute name raises
+    :class:`AttributeError` at patch time. ``run`` resolves both helpers
+    from module globals at call time, so the substitution takes effect for
+    the invocation under test and is undone on teardown.
+    """
+    monkeypatch.setattr(
+        "pipelines.ingest_games._load_existing_games", games_loader,
+    )
+    monkeypatch.setattr(
+        "pipelines.ingest_games._load_existing_pbp", pbp_loader,
+    )
 
 
 class _LoggerSpy(logging.LoggerAdapter):
@@ -534,25 +703,52 @@ class _LoggerSpy(logging.LoggerAdapter):
         ]
 
 
-class _MiniSeasonClient(RecordingClient):
-    """Handwritten client spy that routes on ``params["GameID"]``.
+class _MiniSeasonClient:
+    """Standalone handwritten client spy that routes on ``params["GameID"]``.
 
-    :class:`RecordingClient` keys its responses by *endpoint*, which cannot
-    express "a different box score per game". This subclass adds
-    ``GameID`` routing on top of it while inheriting the recording
-    behaviour verbatim, so ``.calls`` keeps the exact ``(endpoint, params)``
-    shape every other pipeline assertion in the suite relies on.
+    A self-contained, module-local stand-in for
+    :class:`api.nba_client.NBAClient`. It mirrors the production
+    ``get(endpoint, params) -> dict`` signature verbatim (see
+    ``api/nba_client.py`` line 368) and resolves its response by
+    ``GameID``, which is what lets the mini-season return a *different*
+    box score per game -- something an endpoint-keyed spy cannot express.
 
-    Subclassing the handwritten spy -- rather than reaching for a
-    :class:`~unittest.mock.MagicMock` -- is deliberate: an interface drift
-    in the production client surfaces at instantiation time here instead of
-    being masked by attribute-access magic. Both endpoint helpers set
-    ``params["GameID"] = str(game_id)``, so one routing key serves both.
+    It records call tuples on :attr:`calls` using the same
+    ``(endpoint, params)`` shape as the shared ``RecordingClient`` spy, so
+    assertions over ``client.calls`` stay semantically compatible with
+    every other pipeline test in the suite. Owning that recording locally
+    -- rather than deriving from the shared spy -- keeps this
+    single-module concern out of the shared fixture surface entirely; it
+    is the same standalone shape ``_SelectiveFailureClient`` uses in
+    ``test_ingest_games.py``.
+
+    Being *handwritten* rather than a :class:`~unittest.mock.MagicMock` is
+    equally deliberate: a drift in the production client's ``get``
+    signature surfaces here as a real ``TypeError`` at call time instead
+    of being silently absorbed by attribute-access magic.
+
+    Both endpoint helpers set ``params["GameID"] = str(game_id)``
+    (``endpoints/games.py`` lines 251 and 399), so one routing key serves
+    the box-score and play-by-play calls alike.
 
     An unmapped endpoint or an unmapped ``GameID`` raises
     :class:`AssertionError` rather than falling back to a synthetic
     envelope: a silent fallback would let a routing bug feed plausible but
     wrong row counts into the aggregation assertions.
+
+    Attributes
+    ----------
+    calls:
+        Ordered ``(endpoint, params)`` tuples, one appended per
+        :meth:`get` invocation. ``params`` is a defensive shallow copy, so
+        later mutation by the caller cannot retroactively change what was
+        recorded.
+    boxscore_payloads:
+        ``GAME_ID`` -> ``boxscoretraditionalv2`` envelope map, copied at
+        construction time.
+    playbyplay_payloads:
+        ``GAME_ID`` -> ``playbyplayv2`` envelope map, copied at
+        construction time.
     """
 
     def __init__(
@@ -560,16 +756,16 @@ class _MiniSeasonClient(RecordingClient):
         boxscore_payloads: Dict[str, Any],
         playbyplay_payloads: Dict[str, Any],
     ) -> None:
-        super().__init__()
         self.boxscore_payloads: Dict[str, Any] = dict(boxscore_payloads)
         self.playbyplay_payloads: Dict[str, Any] = dict(playbyplay_payloads)
+        self.calls: List[Tuple[str, Dict[str, Any]]] = []
 
     def get(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Record the call on ``.calls``, then route by endpoint and GameID."""
-        # Delegate to the base spy purely for its recording side effect;
-        # its endpoint-keyed return value is discarded because this
-        # subclass resolves the response by ``GameID`` instead.
-        super().get(endpoint, params)
+        """Record the call on :attr:`calls`, then route by endpoint and GameID."""
+        # Snapshot the parameter map defensively before routing, so the
+        # recorded tuple reflects the arguments exactly as they were
+        # passed even if the caller mutates its dict afterwards.
+        self.calls.append((str(endpoint), dict(params or {})))
         if endpoint == _BOXSCORE_ENDPOINT:
             envelopes = self.boxscore_payloads
         elif endpoint == _PLAYBYPLAY_ENDPOINT:
@@ -606,11 +802,15 @@ def test_cumulative_concat_rewrites_running_row_totals_for_both_artifacts(
     Mutation detected: replacing ``pd.concat(games_buffer, ...)`` with the
     single per-game frame ("write only the latest frame") yields the
     per-game counts [2, 3, 2] and [4, 1, 3] instead of the running totals
-    2/2+3=5/5+2=7 and 4/4+1=5/5+3=8. Both sequences are non-decreasing, so
-    the pre-existing monotonicity check cannot separate them -- only the
-    fixture's deliberately unequal per-game counts can. A dropped or
-    double-appended frame, or a swap of the two ``writer.write`` calls
-    inside one iteration, is caught by the same assertions.
+    2/2+3=5/5+2=7 and 4/4+1=5/5+3=8. A monotonicity check on the write
+    sizes cannot separate the two when every game contributes the same
+    number of rows, because the mutant's sequence is then flat and still
+    non-decreasing. The deliberately unequal per-game counts used here make
+    the latest-frame sequences both numerically different from the
+    cumulative totals and non-monotonic, so exact ordered equality is what
+    pins the behaviour. A dropped or double-appended frame, or a swap of the
+    two ``writer.write`` calls inside one iteration, is caught by the same
+    assertions.
     """
     # --- Arrange -------------------------------------------------------
     _patch_mini_season_enumerate(monkeypatch, mini_season_game_ids)
@@ -675,7 +875,7 @@ def test_cumulative_concat_rewrites_running_row_totals_for_both_artifacts(
 
 
 # ---------------------------------------------------------------------------
-# Test B -- the row-written counter carries PER-GAME deltas (headline test)
+# Test B -- the row-written counter carries PER-GAME deltas
 # ---------------------------------------------------------------------------
 
 
@@ -691,14 +891,15 @@ def test_row_written_counter_emits_per_game_deltas_in_emission_order(
 
     Mutation detected: emitting ``n=len(combined_games)`` /
     ``n=len(combined_pbp)`` instead of ``n=len(bs_df)`` / ``n=len(pbp_df)``
-    turns the sequence into the cumulative [2, 4, 5, 5, 7, 8]. The
-    pre-existing ``assert "n" in c.kwargs`` presence-and-positivity check
-    is satisfied by both, so this is the single most important assertion in
-    the module. Renaming or dropping either label empties the per-artifact
-    partitions, and reordering the two ``inc`` calls within an iteration
-    breaks the interleaved sequence. The per-game log event is asserted
-    alongside as an independent witness, so a mutation that corrupted only
-    one of the two observability surfaces is still caught.
+    turns the sequence into the cumulative [2, 4, 5, 5, 7, 8]. Every value
+    in both sequences is positive, so a presence-and-positivity check on the
+    ``n=`` keyword is satisfied either way; only the exact ordered
+    comparison distinguishes a per-game delta from a running frame length.
+    Renaming or dropping either label empties the per-artifact partitions,
+    and reordering the two ``inc`` calls within an iteration breaks the
+    interleaved sequence. The per-game log event is asserted alongside as an
+    independent witness, so a mutation that corrupted only one of the two
+    observability surfaces is still caught.
     """
     # --- Arrange -------------------------------------------------------
     _patch_mini_season_enumerate(monkeypatch, mini_season_game_ids)
@@ -759,20 +960,28 @@ def test_row_written_counter_emits_per_game_deltas_in_emission_order(
     # ``pipeline.games.game_complete game_id=%s box_rows=%d pbp_rows=%d``
     # carries the same per-game counts, so the log and the counter must
     # agree: (G1, 2, 4), (G2, 3, 1), (G3, 2, 3).
+    #
+    # The comparison is against the COMPLETE ``(format string, args)``
+    # record, not the arguments alone. The format string is the operator
+    # contract -- it names the fields a log-parsing rule keys on -- so
+    # renaming ``box_rows``, dropping ``pbp_rows``, swapping ``%d`` for
+    # ``%s``, or appending trailing content after the same prefix must all
+    # fail here even though each leaves the three positional arguments
+    # byte-identical.
     expected_game_events = [
-        (gid, box_rows, pbp_rows)
+        (_GAME_COMPLETE_FORMAT, (gid, box_rows, pbp_rows))
         for gid, (box_rows, pbp_rows) in zip(
             mini_season_game_ids, EXPECTED_GAME_COMPLETE_ROWS,
         )
     ]
-    observed_game_events = [
-        args
-        for _msg, args in logger_spy.info_events_starting(_GAME_COMPLETE_PREFIX)
-    ]
+    observed_game_events = logger_spy.info_events_starting(
+        _GAME_COMPLETE_PREFIX
+    )
     assert observed_game_events == expected_game_events, (
-        f"the per-game completion log must report the PER-GAME row counts "
-        f"{expected_game_events!r} (one event per game, in enumeration "
-        f"order); got {observed_game_events!r}"
+        f"the per-game completion log must emit the exact format string "
+        f"{_GAME_COMPLETE_FORMAT!r} carrying the PER-GAME row counts "
+        f"{[args for _fmt, args in expected_game_events]!r} (one event per "
+        f"game, in enumeration order); got {observed_game_events!r}"
     )
 
 
@@ -984,12 +1193,34 @@ def test_zero_enumerated_games_short_circuits_before_any_aggregation(
       logged -- ``status=skipped reason=all_checkpointed`` versus
       ``processed=0 failed=0`` -- so the spy-only assertions below would
       pass against the mutant without it.
+    * **Hoisting either buffer loader ABOVE the guard** -- a PERFORMANCE
+      regression that every other assertion in this test survives. Both
+      helpers stat the artifact and, when it exists, parse a whole season
+      of rows with :func:`pandas.read_csv`; moving them above the guard
+      makes an all-checkpointed run -- the common case for an operator
+      re-running a completed season -- pay for two file probes and two
+      full CSV parses to produce nothing. Only instrumenting the loaders
+      detects it, which is what the two loader-spy assertions below do.
+      Their non-vacuity is established by
+      ``test_buffer_loaders_run_once_each_after_the_pending_guard``, which
+      proves the very same patch seam records invocations when games ARE
+      pending.
     """
     # --- Arrange -------------------------------------------------------
-    # Enumeration returns nothing; the payload mappings are still supplied
-    # so that any fetch attempt would succeed -- proving the absence of
-    # fetches is the guard's doing, not a missing envelope.
+    # Enumeration returns nothing; the payload mappings are still supplied so
+    # they stay populated for every mini-season ID. A fetch for one of those
+    # mapped IDs therefore could not fail merely because fixture data was
+    # absent, which is what makes the absence of fetches below attributable
+    # to the guard. (Unmapped endpoints and unmapped ``GameID`` values raise
+    # AssertionError by design -- see :class:`_MiniSeasonClient`.)
     _patch_mini_season_enumerate(monkeypatch, [])
+    # Recording spies replace the two prior-session buffer loaders so their
+    # ABSENCE of invocation is assertable. They return [] exactly as the
+    # real helpers do against a RecordingWriter directory holding no CSV,
+    # so nothing else about the run changes.
+    games_loader = _BufferLoaderSpy("_load_existing_games")
+    pbp_loader = _BufferLoaderSpy("_load_existing_pbp")
+    _patch_buffer_loaders(monkeypatch, games_loader, pbp_loader)
     client = _MiniSeasonClient(
         boxscore_payloads=mini_season_boxscore_payloads,
         playbyplay_payloads=mini_season_playbyplay_payloads,
@@ -1058,6 +1289,120 @@ def test_zero_enumerated_games_short_circuits_before_any_aggregation(
         f"processed; got {game_events!r}"
     )
 
+    # --- Assert: neither buffer loader was even reached ----------------
+    # The guard must return BEFORE the prior-session seeds are loaded, so
+    # an all-checkpointed run performs no filesystem probe and no CSV
+    # parse at all. Empty call lists are the only observable proof of that
+    # ordering: every other quantity in this test is identically empty
+    # whether the loaders ran or not.
+    assert games_loader.calls == [], (
+        f"{games_loader.name} must NOT run when nothing is pending -- the "
+        f"if-not-pending guard precedes it precisely so an all-checkpointed "
+        f"run performs no {config.CSV_GAMES}.csv stat and no "
+        f"pandas.read_csv; got {games_loader.calls!r}"
+    )
+    assert pbp_loader.calls == [], (
+        f"{pbp_loader.name} must NOT run when nothing is pending -- same "
+        f"guard, same wasted {config.CSV_PLAY_BY_PLAY}.csv parse; got "
+        f"{pbp_loader.calls!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test E2 -- positive control: both buffer loaders DO run, once, past the guard
+# ---------------------------------------------------------------------------
+
+
+def test_buffer_loaders_run_once_each_after_the_pending_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_writer,
+    recording_checkpoint,
+    mini_season_boxscore_payloads: Dict[str, Any],
+    mini_season_playbyplay_payloads: Dict[str, Any],
+    mini_season_game_ids: List[str],
+) -> None:
+    """Each buffer loader is invoked exactly once, with the pending list.
+
+    This is the POSITIVE CONTROL for Test E's "neither loader was called"
+    assertions. Without it those assertions could only prove that *nothing*
+    reached the loaders -- not that the same patch seam is capable of
+    observing an invocation at all. Here the identical seam records one call
+    per loader, so Test E's empty call lists are attributable to the
+    ``if not pending:`` guard rather than to an inert spy.
+
+    It also pins the loaders' own resume contract, which is otherwise
+    unasserted: each receives the WRITER's ``output_dir`` (so artifacts are
+    sought where they are written, never in the operator's real
+    ``config.OUTPUT_DIR``), the caller's season, and the FULL pending list
+    -- the last of which the helpers need to filter already-present rows
+    for the games about to be re-fetched.
+
+    Mutations detected
+    ------------------
+    * Calling either loader twice, or once per pending game instead of once
+      per run: a season of 1,230 games would then perform 1,230 CSV parses
+      instead of one, and the per-run call-count assertions fail.
+    * Passing ``config.OUTPUT_DIR`` instead of the writer's directory: a
+      test run would read the operator's real artifacts, and the recorded
+      ``output_dir`` no longer matches ``writer.output_dir``.
+    * Passing the full enumerated list, an empty list, or a single
+      ``GAME_ID`` where the pending list belongs: the recorded tuple stops
+      matching, and the loaders would lose their ability to dedupe
+      prior-session rows for exactly the games being re-fetched.
+    """
+    # --- Arrange -------------------------------------------------------
+    # A fresh checkpoint means every enumerated game is pending, so the
+    # guard falls through and the loaders must run.
+    _patch_mini_season_enumerate(monkeypatch, mini_season_game_ids)
+    games_loader = _BufferLoaderSpy("_load_existing_games")
+    pbp_loader = _BufferLoaderSpy("_load_existing_pbp")
+    _patch_buffer_loaders(monkeypatch, games_loader, pbp_loader)
+    client = _MiniSeasonClient(
+        boxscore_payloads=mini_season_boxscore_payloads,
+        playbyplay_payloads=mini_season_playbyplay_payloads,
+    )
+    writer = recording_writer()
+    checkpoint = recording_checkpoint()
+    metrics_mock = MagicMock()
+
+    # --- Act -----------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+        metrics=metrics_mock,
+    )
+
+    # --- Assert: exactly one invocation each, with the exact arguments --
+    # Hand-derived: ``run`` resolves the directory as
+    # ``getattr(writer, "output_dir", config.OUTPUT_DIR)``, and a fresh
+    # checkpoint leaves all three enumerated ids pending, so each loader
+    # must see (writer.output_dir, "2025-26", (G1, G2, G3)) exactly once.
+    expected_loader_calls = [
+        (writer.output_dir, _SEASON, tuple(mini_season_game_ids)),
+    ]
+    assert games_loader.calls == expected_loader_calls, (
+        f"{games_loader.name} must run exactly once, seeded from the "
+        f"writer's own output directory and handed the full pending list "
+        f"{expected_loader_calls!r}; got {games_loader.calls!r}"
+    )
+    assert pbp_loader.calls == expected_loader_calls, (
+        f"{pbp_loader.name} must run exactly once with the same "
+        f"{expected_loader_calls!r}; got {pbp_loader.calls!r}"
+    )
+
+    # --- Assert: substituting the spies changed no aggregate ------------
+    # Fidelity check for Test E: the spies seed [] exactly as the real
+    # helpers do against a RecordingWriter directory holding no CSV, so the
+    # cumulative sizes must remain the canonical 2 ; 2+3=5 ; 5+2=7.
+    games_sizes = [w["rows"] for w in _writes_named(writer, config.CSV_GAMES)]
+    assert games_sizes == EXPECTED_CUMULATIVE_GAMES_ROWS, (
+        f"seeding an empty buffer must leave the cumulative games-CSV sizes "
+        f"at {EXPECTED_CUMULATIVE_GAMES_ROWS} (2 ; 2+3=5 ; 5+2=7), proving "
+        f"the loader spies are behaviour-preserving; got {games_sizes}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Test F -- boundary: a 0x0 primary frame still writes and still checkpoints
@@ -1083,9 +1428,10 @@ def test_degenerate_zero_by_zero_frame_still_writes_and_checkpoints(
     Mutation detected: a "skip the write when the frame is empty" or
     "skip the counter when the frame is empty" short circuit, and any
     change that lets a degenerate-but-valid payload fall into the Rule 6
-    handler. Asserting ``games_failed_total`` was never incremented is
-    mandatory here: without it, a swallowed exception would masquerade as
-    success.
+    handler -- the recorded write, the ``[0, 4]`` increments and the
+    checkpoint mark all vanish once an exception is swallowed there. The
+    zero-``games_failed_total`` assertion is an additional negative-space
+    check that names that failure mode explicitly.
     """
     # --- Arrange -------------------------------------------------------
     # Exactly one game, whose box score is degenerate while its
@@ -1145,6 +1491,19 @@ def test_degenerate_zero_by_zero_frame_still_writes_and_checkpoints(
         f"the counter must report the zero verbatim as "
         f"{EXPECTED_BOUNDARY_INCREMENTS} (games 0, play-by-play 4); "
         f"got {boundary_increments}"
+    )
+    # ...and each value must be attributed to the RIGHT artifact. The
+    # values alone survive a label swap, which would report the empty box
+    # score against play_by_play.csv and G1's four events against
+    # games.csv -- inverting every per-artifact dashboard while the
+    # assertion above still passed.
+    boundary_emissions = _row_written_emissions(metrics_mock)
+    assert boundary_emissions == EXPECTED_BOUNDARY_EMISSIONS, (
+        f"the ordered (labels, n) emissions must be "
+        f"{EXPECTED_BOUNDARY_EMISSIONS!r} -- the zero owned by "
+        f"{config.CSV_GAMES}.csv and the 4 owned by "
+        f"{config.CSV_PLAY_BY_PLAY}.csv, each under the complete "
+        f"pipeline/artifact label set; got {boundary_emissions!r}"
     )
 
     # --- Assert: checkpointed, and Rule 6 never engaged ---------------
@@ -1229,6 +1588,16 @@ def test_zero_row_frame_with_declared_headers_keeps_payload_columns(
         f"a header-only frame must still be counted verbatim as "
         f"{EXPECTED_BOUNDARY_INCREMENTS} (games 0, play-by-play 4); "
         f"got {boundary_increments}"
+    )
+    # Same artifact-ownership pin as the 0x0 case: a swapped or malformed
+    # label mapping leaves the [0, 4] value sequence intact, so only the
+    # ordered (labels, n) pairs can detect it.
+    boundary_emissions = _row_written_emissions(metrics_mock)
+    assert boundary_emissions == EXPECTED_BOUNDARY_EMISSIONS, (
+        f"the ordered (labels, n) emissions must be "
+        f"{EXPECTED_BOUNDARY_EMISSIONS!r} -- the header-only frame's zero "
+        f"owned by {config.CSV_GAMES}.csv and the 4 owned by "
+        f"{config.CSV_PLAY_BY_PLAY}.csv; got {boundary_emissions!r}"
     )
     assert checkpoint.marks == [(config.DOMAIN_GAMES, game_id)], (
         f"a header-only frame must still be checkpointed as "
