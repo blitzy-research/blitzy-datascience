@@ -14,7 +14,7 @@ Contracts pinned here
   exercised exclusively by feeding malformed envelopes to the public
   ``normalize_result_sets``. No private helper is imported, promoted, or
   given a test-only hook, so no production source file changes.
-* **Seven rejection branches, seven exact messages.** Each envelope in
+* **Ten rejection branches, ten exact messages.** Each envelope in
   the shared ``malformed_result_set_payloads`` fixture is the minimal
   shape that trips exactly one guard, and each expected message is the
   verbatim production string with its source line cited in
@@ -37,57 +37,33 @@ Contracts pinned here
   supplied as the string ``"31"`` therefore stays an ``object``-dtype
   ``str``. The normalizer's job is faithful structural translation, and
   that is asserted rather than assumed.
-* **Duplicate names are uniquified, never overwritten.** Two strictly
-  different cases are covered here, and confusing them is precisely what
-  let a real defect (CD-2, below) survive: the **near miss**, where an
-  upstream name already ends in a digit (``PlayByPlay2`` ->
-  ``play_by_play2``) and merely resembles the generated
-  ``play_by_play_2`` without ever occupying it; and the **true
-  collision**, where an upstream name snake-cases to exactly the key the
-  uniquifier wants to generate (``PlayByPlay_2`` -> ``play_by_play_2``)
-  and therefore does occupy it.
-
-Confirmed defect CD-2 and its minimal fix
------------------------------------------
-Constraint C2 permits exactly one kind of non-test source change — a
-minimal fix for a genuine bug, called out explicitly with the failing
-case. This module documents one such fix.
-
-* **Site.** ``utils/schema_normalizer.py``, the duplicate-name
-  uniquifier inside ``normalize_result_sets``.
-* **Failing case that motivated it.** A ``playbyplayv2`` envelope whose
-  ``resultSets`` are named, in order, ``PlayByPlay``, ``PlayByPlay_2``,
-  ``PlayByPlay`` — three tables carrying three distinct rows.
-* **Behaviour before the fix.** ``normalize_result_sets`` returned only
-  ``['play_by_play', 'play_by_play_2']`` — **two frames for three
-  upstream tables** — because the third table's generated key
-  ``play_by_play_2`` was already held by the second table and the
-  uniquifier assigned it unconditionally. The second table's DataFrame
-  was replaced by the third's and vanished from the mapping. **No
-  exception was raised**, so a schema-drifting or hostile upstream could
-  delete an entire result table from every downstream DataFrame and CSV
-  artifact while the pipeline reported success (CWE-20, integrity
-  overwrite).
-* **Behaviour after the fix.** ``['play_by_play', 'play_by_play_2',
-  'play_by_play_3']``, with cells ``1``, ``2``, ``3`` respectively — one
-  frame per upstream table, each holding its own data.
-* **The change.** The generated ordinal is a starting point rather than
-  a verdict: a ``while`` probe advances it until the candidate key is
-  unoccupied. No signature, return type, import, raise, or control-flow
-  branch outside the pre-existing duplicate branch was touched, and the
-  McCabe complexity of ``normalize_result_sets`` remains far below the
-  ceiling of 12.
-* **Behaviour deliberately preserved.** Both hand-derived key lists in
-  AAP §0.4.2.3 are unchanged by the fix: three tables all named ``X``
-  still yield ``['x', 'x_2', 'x_3']`` (asserted by the sibling
-  ``test_schema_normalizer.py``), and the near-miss envelope still
-  yields ``['play_by_play', 'play_by_play2', 'play_by_play_2']``. Only
-  the previously destructive branch behaves differently.
-* **The matched test.**
-  :func:`test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table`
-  fails against the unfixed source and passes against the fixed one;
-  :func:`test_duplicate_name_probes_past_consecutive_occupied_keys_without_loss`
-  additionally rules out a one-shot retry that would still lose a table.
+* **Duplicate names are uniquified, never overwritten — while the
+  generated key is free.** A name that repeats within one envelope is
+  suffixed with the next ordinal (``PlayByPlay`` twice ->
+  ``play_by_play`` and ``play_by_play_2``) instead of the second table
+  replacing the first, and the near-miss spelling that merely
+  *resembles* a generated key stays distinct from it: an upstream name
+  already ending in a digit snake-cases to ``play_by_play2`` (no
+  underscore) while the generated suffix is ``play_by_play_2`` (with
+  one). Both hand-derived key lists in AAP §0.4.2.3 are pinned —
+  ``['x', 'x_2', 'x_3']`` by the sibling ``test_schema_normalizer.py``
+  and ``['play_by_play', 'play_by_play2', 'play_by_play_2']`` here.
+* **The occupied-generated-suffix case is a KNOWN DEFECT, and is
+  characterised rather than glossed over.** When the ordinal the
+  uniquifier computes names a key an earlier table already holds, the
+  assignment overwrites that earlier frame and one upstream table
+  disappears from the mapping with no exception raised. Two tests below
+  pin that behaviour exactly — including the frame count against the
+  upstream table count — so the suite documents the loss instead of
+  masking it. They deliberately encode CURRENT behaviour, which the AAP
+  sanctions in §0.4.5 ("leave the source untouched and instead add a
+  test documenting the current behavior with a comment naming the
+  defect"), because ``utils/schema_normalizer.py`` is frozen: AAP §0.8.2
+  places all of ``utils/*.py`` out of scope, §0.10.1 admits nothing
+  beyond the listed test changes, and §0.10.2 exercises exactly one
+  source exception (CD-1, in ``endpoints/schedule.py``). Each test names
+  the one-statement fix that would remove the defect and states that
+  applying it must update the test in the same change.
 * **Every expected value is hand-derived, never captured.** Each
   constant below is justified by the production source lines cited
   beside it — no assertion compares against recorded output, no
@@ -169,6 +145,24 @@ EXPECTED_MESSAGES: Dict[str, str] = {
     "missing_name": (
         "Result set is missing required string field 'name' (got NoneType)"
     ),
+    # L233-236 again, reached through the SECOND clause of the same guard
+    # (L232): ``if not isinstance(value, str) or not value``. Here ``name``
+    # is present as the int 7, so ``isinstance(value, str)`` is False and
+    # ``type(7).__name__`` is "int". Without this case a mutation narrowing
+    # the guard to ``if value is None`` stays green: the int would flow into
+    # ``_snake_case`` (L130) and raise ``TypeError`` from the regex engine
+    # instead of the operator-facing ``ValueError``.
+    "name_not_string": (
+        "Result set is missing required string field 'name' (got int)"
+    ),
+    # L233-236 once more, reached through the ``or not value`` clause alone:
+    # ``name`` is present AND is a str, so only emptiness can reject it, and
+    # ``type("").__name__`` is "str". Without this case a mutation dropping
+    # ``or not value`` stays green: an empty name would be accepted and keyed
+    # as the empty string, silently producing a nameless artifact stem.
+    "name_empty": (
+        "Result set is missing required string field 'name' (got str)"
+    ),
     # L267-270: f"Result set field '{key}' must be a list; "
     #           f"got {type(value).__name__}"
     # Envelope supplies headers as the dict {"A": 1} -> "dict".
@@ -181,6 +175,15 @@ EXPECTED_MESSAGES: Dict[str, str] = {
     # (L244-246): only a non-list trips this guard.
     "missing_row_set": (
         "Result set field 'rowSet' must be a list; got NoneType"
+    ),
+    # L267-270 again for the ``rowSet`` key, this time with the key PRESENT
+    # and holding the dict ``{}`` -> "dict". The absent-key case above can
+    # only prove the guard rejects ``None``; this one proves it rejects a
+    # concrete wrong TYPE, so a mutation narrowing the check to
+    # ``if value is None`` is caught. The two together also pin that the
+    # message reports the offending type rather than a fixed word.
+    "row_set_not_list": (
+        "Result set field 'rowSet' must be a list; got dict"
     ),
     # L135-137: f"Result set '{name}' contains non-string headers: {headers}"
     # ``{headers}`` interpolates the list's repr, so ["A", 7] renders as
@@ -210,10 +213,14 @@ EXPECTED_MESSAGES: Dict[str, str] = {
     ),
 }
 
-#: One malformed envelope per rejection branch. Fixed by the seven-entry
+#: One malformed envelope per rejection branch. Fixed by the ten-entry
 #: table above; asserted against the shared fixture so a dropped envelope
-#: cannot silently shrink the parametrized matrix.
-EXPECTED_REJECTION_BRANCH_COUNT = 7
+#: cannot silently shrink the parametrized matrix. Ten, not seven, because
+#: the two multi-condition guards are covered on every condition: three
+#: ``name`` rows for ``_require_str``'s absent / non-string / empty
+#: conditions, and two ``rowSet`` rows for ``_require_list``'s absent-key
+#: and wrong-type conditions.
+EXPECTED_REJECTION_BRANCH_COUNT = 10
 
 #: Deterministic ``(case, expected_message)`` pairs for parametrization.
 #: A fixture cannot be referenced inside ``@pytest.mark.parametrize``, so
@@ -254,12 +261,13 @@ EXPECTED_NOTE_NULL_MASK: list[bool] = [False, True]
 
 #: Keys produced by the duplicate-name NEAR-MISS envelope, whose tables
 #: are named ``PlayByPlay``, ``PlayByPlay2``, ``PlayByPlay`` in that
-#: order. This envelope is a near miss and NOT a true collision: the key
-#: the uniquifier generates for the third table is never occupied. The
-#: genuinely occupied-key case lives in
-#: :data:`EXPECTED_TRUE_COLLISION_KEYS`. Derivation, traced through both
-#: ``_snake_case`` regexes (L396 / L400 / L433-435) and the uniquifier
-#: (L142-157):
+#: order. It is the second of the two key lists AAP §0.4.2.3 derives by
+#: hand, and it is a near miss rather than an exact clash: the digit
+#: suffix the upstream itself supplies (``play_by_play2``) differs by one
+#: character from the suffix the uniquifier generates
+#: (``play_by_play_2``), so all three tables keep their own key.
+#: Derivation, traced through both ``_snake_case`` regexes (L396 / L400 /
+#: L433-435) and the uniquifier (L142-147):
 #:
 #: * ``"PlayByPlay"``: ``_CAMEL_BOUNDARY_1`` matches ``"yBy"`` at
 #:   offset 3 -> ``"Play_ByPlay"``; ``_CAMEL_BOUNDARY_2`` then matches
@@ -270,10 +278,10 @@ EXPECTED_NOTE_NULL_MASK: list[bool] = [False, True]
 #:   ``play_by_play_2`` the uniquifier would generate; it takes a bare
 #:   key and occupies nothing the uniquifier wants.
 #: * The third table snake-cases to ``"play_by_play"``, which is already
-#:   a key, so the ordinal starts at ``seen_names.get("play_by_play",
-#:   1) + 1 == 2``; the candidate ``"play_by_play_2"`` is FREE (only
-#:   ``play_by_play2``, without the underscore, is taken), so the probe
-#:   stops immediately and the key becomes ``"play_by_play_2"``.
+#:   a key, so the ordinal is ``seen_names.get("play_by_play", 1) + 1 ==
+#:   2`` and the suffixed key is ``"play_by_play_2"`` — distinct from the
+#:   ``play_by_play2`` the second table holds, because that spelling has
+#:   no underscore before its digit.
 EXPECTED_NEAR_MISS_KEYS: list[str] = [
     "play_by_play",
     "play_by_play2",
@@ -284,54 +292,66 @@ EXPECTED_NEAR_MISS_KEYS: list[str] = [
 #: distinct values prove no table was lost and none was overwritten.
 EXPECTED_NEAR_MISS_CELLS: list[int] = [1, 2, 3]
 
-#: Keys produced by the TRUE duplicate-name collision envelope, whose
-#: tables are named ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay`` in
-#: that order. Here the upstream name of the SECOND table snake-cases to
-#: exactly the key the uniquifier wants to generate for the THIRD, so the
-#: generated key is genuinely OCCUPIED. Derivation:
+#: Number of upstream tables in the two OCCUPIED-SUFFIX envelopes below.
+#: Held as constants so each test can compare the returned frame count
+#: against the number of tables sent, which is what quantifies the loss.
+OCCUPIED_SUFFIX_TABLE_COUNT = 3
+CONSECUTIVE_SUFFIX_TABLE_COUNT = 5
+
+#: Keys produced by the OCCUPIED-generated-suffix envelope, whose tables
+#: are named ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay`` in that
+#: order. Unlike the near miss above, the second table's own upstream name
+#: snake-cases to EXACTLY the key the uniquifier will generate for the
+#: third, so the two collide. Derivation, traced through the same regexes
+#: (L396 / L400 / L433-435) and uniquifier (L142-147):
 #:
-#: * Table 1 ``"PlayByPlay"`` -> ``"play_by_play"``; free, taken as-is.
-#: * Table 2 ``"PlayByPlay_2"`` -> ``"play_by_play_2"``; the underscore
-#:   is already present in the upstream name and both regexes leave it
-#:   alone, so this is a bare key and it too is free.
-#: * Table 3 ``"PlayByPlay"`` -> ``"play_by_play"``, already a key. The
-#:   ordinal starts at ``2``, whose candidate ``"play_by_play_2"`` is
-#:   OCCUPIED by table 2, so the probe advances to ``3`` and the key
-#:   becomes ``"play_by_play_3"``.
+#: * table 1 ``"PlayByPlay"`` -> ``"play_by_play"``; the key is free, so
+#:   ``dataframes["play_by_play"] = <table 1>``.
+#: * table 2 ``"PlayByPlay_2"``: ``_CAMEL_BOUNDARY_1`` gives
+#:   ``"Play_ByPlay_2"``, ``_CAMEL_BOUNDARY_2`` gives ``"Play_By_Play_2"``,
+#:   lower/strip -> ``"play_by_play_2"``. That name is NOT yet a key, so it
+#:   takes the bare form: ``dataframes["play_by_play_2"] = <table 2>``.
+#: * table 3 ``"PlayByPlay"`` -> ``"play_by_play"``, which IS a key, so the
+#:   ordinal is ``seen_names.get("play_by_play", 1) + 1 == 2`` and the
+#:   generated key is ``"play_by_play_2"`` — ALREADY HELD by table 2. The
+#:   assignment ``dataframes[deduped] = df`` (L146) is unconditional, so
+#:   table 2's frame is replaced and vanishes.
 #:
-#: Assigning the first candidate unconditionally — which is what the
-#: uniquifier did before the fix recorded in this module's docstring —
-#: replaced table 2's DataFrame with table 3's and returned only TWO
-#: frames for THREE upstream tables, with no exception raised.
-EXPECTED_TRUE_COLLISION_KEYS: list[str] = [
+#: Result: TWO keys for THREE upstream tables. This is the defect the
+#: module docstring names; the constants are its characterisation, not an
+#: endorsement.
+EXPECTED_OCCUPIED_SUFFIX_KEYS: list[str] = [
     "play_by_play",
     "play_by_play_2",
-    "play_by_play_3",
 ]
 
-#: First-column cell of each true-collision frame, in key order. These
-#: three distinct values are the whole point of the test: a correct key
-#: LIST can still hide an overwrite, and only the cells prove that
-#: ``play_by_play_2`` still holds table 2's data rather than table 3's.
-EXPECTED_TRUE_COLLISION_CELLS: list[int] = [1, 2, 3]
+#: First-column cell of each surviving frame, in key order. Table 1 keeps
+#: cell ``1``; the ``play_by_play_2`` key holds table 3's cell ``3``, not
+#: table 2's cell ``2`` — the missing ``2`` IS the lost table.
+EXPECTED_OCCUPIED_SUFFIX_CELLS: list[int] = [1, 3]
 
-#: Keys produced by the CONSECUTIVE-occupancy envelope ``PlayByPlay``,
-#: ``PlayByPlay_2``, ``PlayByPlay_3``, ``PlayByPlay``. The first three
-#: names are distinct and take bare keys ``play_by_play``,
-#: ``play_by_play_2`` and ``play_by_play_3``; the fourth repeats
-#: ``play_by_play``, so the ordinal probe must step over TWO occupied
-#: candidates (``_2`` then ``_3``) before landing on the free ``_4``.
-#: This is the case that distinguishes a probe from a single retry: a
-#: fix that checked the candidate only once would still overwrite here.
-EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS: list[str] = [
-    "play_by_play",
-    "play_by_play_2",
-    "play_by_play_3",
-    "play_by_play_4",
-]
+#: Keys produced by the CONSECUTIVE-occupancy envelope, whose tables are
+#: named ``X``, ``X_2``, ``X_3``, ``X``, ``X`` in that order. It proves the
+#: loss compounds: the uniquifier advances its ordinal per repeat without
+#: checking occupancy, so each repeat displaces the sibling holding that
+#: ordinal. Derivation (``_snake_case`` lowercases each name unchanged —
+#: no CamelCase boundary matches a single letter or a letter-digit pair):
+#:
+#: * table 1 ``X`` -> ``x`` (free) -> ``x`` holds cell 1.
+#: * table 2 ``X_2`` -> ``x_2`` (free, a different upstream NAME) -> cell 2.
+#: * table 3 ``X_3`` -> ``x_3`` (free) -> cell 3.
+#: * table 4 ``X`` repeats ``x``: ordinal ``1 + 1 == 2`` -> ``x_2``, already
+#:   held by table 2, which is replaced by cell 4.
+#: * table 5 ``X`` repeats ``x``: ordinal ``2 + 1 == 3`` -> ``x_3``, already
+#:   held by table 3, which is replaced by cell 5.
+#:
+#: Result: THREE keys for FIVE upstream tables — two frames lost.
+EXPECTED_CONSECUTIVE_SUFFIX_KEYS: list[str] = ["x", "x_2", "x_3"]
 
-#: First-column cell of each consecutive-occupancy frame, in key order.
-EXPECTED_CONSECUTIVE_OCCUPANCY_CELLS: list[int] = [1, 2, 3, 4]
+#: First-column cell of each surviving frame, in key order: table 1's
+#: ``1``, then table 4's ``4`` and table 5's ``5`` in the slots tables 2
+#: and 3 originally held. The absent ``2`` and ``3`` are the lost tables.
+EXPECTED_CONSECUTIVE_SUFFIX_CELLS: list[int] = [1, 4, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -531,51 +551,41 @@ def test_numeric_supplied_as_string_is_not_coerced_to_a_number() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Duplicate result-set names — the NEAR MISS and the TRUE COLLISION
+# Duplicate result-set names — uniquification instead of overwriting
 # ---------------------------------------------------------------------------
 #
 # Duplicate names are a duplicate-record concern inside the PARSING
 # stage: two tables sharing a name must both survive, because the
-# uniquifier (L142-157) is the only thing standing between a repeated
+# uniquifier (L142-147) is the only thing standing between a repeated
 # upstream name and one table's data vanishing from the output.
 #
-# Two distinct and strictly ordered cases are covered here, and the
-# difference between them is the whole point of this section:
-#
-# 1. NEAR MISS -- ``PlayByPlay``, ``PlayByPlay2``, ``PlayByPlay``.
-#    ``PlayByPlay2`` snake-cases to ``play_by_play2`` (no underscore)
-#    while the repeated ``PlayByPlay`` generates ``play_by_play_2``
-#    (with one). They differ by a single character, so the generated key
-#    is NEVER occupied and the occupied-key branch is never reached.
-#    This case proves the two spellings stay apart; it proves nothing
-#    about occupancy, and its name and docstring say so plainly.
-#
-# 2. TRUE COLLISION -- ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay``.
-#    ``PlayByPlay_2`` snake-cases to exactly ``play_by_play_2``, which
-#    IS the key the uniquifier generates for the third table. This is
-#    the reachable data-destruction case: a single unconditional
-#    assignment replaces the second table's frame with the third's and
-#    returns two frames for three upstream tables, silently, with no
-#    exception. It is the case the fix in this module's docstring closes.
+# The envelope exercised here is the second of the two key lists AAP
+# §0.4.2.3 derives by hand: ``PlayByPlay``, ``PlayByPlay2``,
+# ``PlayByPlay``. ``PlayByPlay2`` snake-cases to ``play_by_play2`` (no
+# underscore) while the repeated ``PlayByPlay`` is suffixed to
+# ``play_by_play_2`` (with one), so the two spellings stay one character
+# apart and all three tables keep their own key and their own data. The
+# first of the two lists — three tables all named ``X`` yielding
+# ``['x', 'x_2', 'x_3']`` — is owned by the sibling module
+# ``tests/unit/utils/test_schema_normalizer.py`` and is deliberately not
+# duplicated here.
 # ---------------------------------------------------------------------------
 
 
 def test_duplicate_name_beside_a_digit_suffixed_sibling_keeps_every_table() -> None:
-    """A repeated name and a digit-suffixed sibling stay distinct — a NEAR MISS.
+    """A repeated name and a digit-suffixed sibling stay distinct, keeping 3 tables.
 
     Hand-derived in :data:`EXPECTED_NEAR_MISS_KEYS`: ``PlayByPlay`` ->
     ``play_by_play``, ``PlayByPlay2`` -> ``play_by_play2`` (a different
     upstream name with no underscore, so it keeps a bare key), and the
-    repeated ``PlayByPlay`` -> ``play_by_play_2`` from an ordinal that
-    starts at ``seen_names.get("play_by_play", 1) + 1`` and stops
-    immediately because that candidate is free.
+    repeated ``PlayByPlay`` -> ``play_by_play_2`` from the ordinal
+    ``seen_names.get("play_by_play", 1) + 1 == 2``. Three tables in,
+    three frames out, each holding its own row.
 
-    This envelope is deliberately a NEAR MISS, not a collision: the
-    generated key is never occupied, so the occupied-key probe is not
-    exercised here. The genuinely occupied case is
-    :func:`test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table`
-    and the two must not be confused — passing this test alone would
-    leave the reachable overwrite undetected.
+    This is the exact key list AAP §0.4.2.3 derives by hand for this
+    envelope, and it is asserted as a whole ordered list together with
+    the distinguishing first cell of every frame — a correct key list
+    alone cannot detect an overwrite, only the cells can.
 
     Mutations detected: replacing the suffixing with plain assignment --
     the third table would overwrite the first, leaving two keys and the
@@ -616,34 +626,73 @@ def test_duplicate_name_beside_a_digit_suffixed_sibling_keeps_every_table() -> N
     )
 
 
-def test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table() -> None:
-    """A repeat whose generated ``_2`` key is already TAKEN must not overwrite it.
+# ---------------------------------------------------------------------------
+# Duplicate result-set names — the OCCUPIED-suffix defect, characterised
+# ---------------------------------------------------------------------------
+#
+# The near-miss envelope above is loss-free because the sibling's spelling
+# (``play_by_play2``) differs from the generated key (``play_by_play_2``).
+# When the two coincide, the uniquifier's ordinal is a verdict rather than
+# a starting point: L142-147 computes ONE candidate key and assigns to it
+# unconditionally, so an earlier table holding that key is replaced and
+# disappears from the returned mapping with no exception raised.
+#
+# The two tests below characterise that behaviour EXACTLY, in the shape AAP
+# §0.4.5 prescribes for a defect whose source file is frozen: "leave the
+# source untouched and instead add a test documenting the current behavior
+# with a comment naming the defect. Constraint C2 outranks the optional
+# fix." ``utils/schema_normalizer.py`` is frozen by AAP §0.8.2 (all of
+# ``utils/*.py`` out of scope), §0.10.1 ("Nothing else") and §0.10.2 (CD-1
+# in ``endpoints/schedule.py`` is the sole source exception), and this
+# module's own file brief repeats the prohibition verbatim.
+#
+# THE DEFECT, with the failing case that exposes it:
+#
+#   envelope tables named ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay``
+#   -> ``{'play_by_play': <table 1>, 'play_by_play_2': <table 3>}``
+#   Table 2's DataFrame is gone: 3 tables in, 2 frames out, silently.
+#
+# THE MINIMAL FIX (three statements, for whoever authorises it) — make the
+# ordinal a starting point and probe forward to the first FREE key:
+#
+#   ordinal = seen_names.get(name, 1) + 1
+#   while f"{name}_{ordinal}" in dataframes:
+#       ordinal += 1
+#   seen_names[name] = ordinal
+#   dataframes[f"{name}_{ordinal}"] = df
+#
+# That yields ``['play_by_play', 'play_by_play_2', 'play_by_play_3']`` with
+# cells ``[1, 2, 3]`` and leaves every currently-asserted key sequence
+# (``['x','x_2','x_3']`` in the frozen sibling module, and the near miss
+# above) untouched. Applying it MUST update the two tests below in the same
+# change: they assert today's lossy behaviour on purpose, so they act as a
+# tripwire that forces the fix to be deliberate rather than incidental.
+# ---------------------------------------------------------------------------
 
-    This is the reachable data-destruction case, and the failing case
-    that motivated the one-statement uniquifier fix recorded in this
-    module's docstring. Upstream envelope, in order: ``PlayByPlay``
-    (cell ``1``), ``PlayByPlay_2`` (cell ``2``), ``PlayByPlay`` (cell
-    ``3``).
 
-    Hand-derived in :data:`EXPECTED_TRUE_COLLISION_KEYS`: table 2's own
-    name snake-cases to ``play_by_play_2``, which is EXACTLY the key the
-    uniquifier generates for table 3, so the ordinal must advance from
-    ``2`` to the free ``3`` and produce ``play_by_play_3``.
+def test_repeat_whose_generated_key_is_occupied_drops_the_occupying_table() -> None:
+    """3 tables named PlayByPlay / PlayByPlay_2 / PlayByPlay return only 2 frames.
 
-    Before the fix this envelope returned only ``['play_by_play',
-    'play_by_play_2']`` with ``play_by_play_2`` holding cell ``3`` --
-    two frames for three upstream tables, table 2's data destroyed, and
-    NO exception raised. A schema-drifting or hostile upstream could
-    therefore delete an entire result table from every downstream
-    DataFrame and CSV artifact while the pipeline reported success.
+    Characterises the KNOWN DEFECT named in the section comment above,
+    hand-derived in :data:`EXPECTED_OCCUPIED_SUFFIX_KEYS` and
+    :data:`EXPECTED_OCCUPIED_SUFFIX_CELLS`: the repeated ``PlayByPlay``
+    generates ``play_by_play_2``, which table 2 already holds under its own
+    upstream name, and the unconditional assignment at L146 replaces it.
+    The returned mapping therefore has 2 entries for 3 upstream tables and
+    the cell sequence is ``[1, 3]`` — the missing ``2`` is the lost table.
 
-    Mutation detected: reverting the probe to a single
-    ``seen_names.get(name, 1) + 1`` assignment. The length assertion, the
-    key-list assertion and the cell assertion each fail independently,
-    and the cell assertion is the one that proves the surviving frame is
-    table 2's data rather than table 3's.
+    Asserting the frame count against
+    :data:`OCCUPIED_SUFFIX_TABLE_COUNT` is what makes the loss explicit
+    and quantified rather than implied by a key list.
+
+    Mutations detected: dropping the uniquifier entirely so a repeat
+    overwrites the BARE key (cells would read ``[3, 2]``); renumbering the
+    ordinal from ``_1`` or changing the separator (the key list changes);
+    and any change to how a repeated name is keyed at all. Applying the
+    three-statement probe fix quoted above also fails this test by design
+    — see the section comment: the fix and this test must land together.
     """
-    # Arrange -- table 2's upstream name IS table 3's generated key.
+    # Arrange -- table 2's upstream name IS the key table 3 will generate.
     payload: Dict[str, Any] = {
         "resultSets": [
             {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[1]]},
@@ -651,95 +700,105 @@ def test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table() -> N
             {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[3]]},
         ]
     }
-    expected_table_count = len(payload["resultSets"])
 
     # Act
     out = normalize_result_sets(payload)
-
-    # Assert -- loss-free first: three tables in, three frames out.
-    assert len(out) == expected_table_count, (
-        f"the uniquifier must never drop a table; the envelope declared "
-        f"{expected_table_count} result sets but normalize_result_sets "
-        f"returned {len(out)} frames ({list(out.keys())}). A missing frame "
-        f"means one table silently overwrote another"
-    )
 
     # Assert -- the complete ordered key list, not a membership check.
-    assert list(out.keys()) == EXPECTED_TRUE_COLLISION_KEYS, (
-        f"the repeated name's generated key was already occupied, so the "
-        f"ordinal must advance past it; expected "
-        f"{EXPECTED_TRUE_COLLISION_KEYS} but got {list(out.keys())}"
+    assert list(out.keys()) == EXPECTED_OCCUPIED_SUFFIX_KEYS, (
+        f"an occupied generated suffix currently yields "
+        f"{EXPECTED_OCCUPIED_SUFFIX_KEYS}; got {list(out.keys())}"
     )
 
-    # Assert -- distinguishing cells prove WHICH table each key holds. A
-    # correct key list alone cannot detect an overwrite; this can.
-    observed_cells = [int(out[key].iloc[0, 0]) for key in EXPECTED_TRUE_COLLISION_KEYS]
-    assert observed_cells == EXPECTED_TRUE_COLLISION_CELLS, (
-        f"each key must map to its OWN table's data; expected cells "
-        f"{EXPECTED_TRUE_COLLISION_CELLS} but got {observed_cells}. A "
-        f"{EXPECTED_TRUE_COLLISION_CELLS[-1]} under key "
-        f"{EXPECTED_TRUE_COLLISION_KEYS[1]!r} means the last table "
-        f"overwrote the second"
+    # Assert -- the loss, quantified: frames returned vs tables supplied.
+    assert len(out) == len(EXPECTED_OCCUPIED_SUFFIX_KEYS), (
+        f"expected {len(EXPECTED_OCCUPIED_SUFFIX_KEYS)} frames; got {len(out)}"
+    )
+    assert len(out) < OCCUPIED_SUFFIX_TABLE_COUNT, (
+        f"this test exists because one table is LOST: "
+        f"{OCCUPIED_SUFFIX_TABLE_COUNT} tables were supplied but only "
+        f"{len(out)} frames returned. If this assertion fails because "
+        f"len(out) == {OCCUPIED_SUFFIX_TABLE_COUNT}, the loss-free probe fix "
+        f"has been applied and this test must be updated to expect "
+        f"['play_by_play', 'play_by_play_2', 'play_by_play_3'] with cells "
+        f"[1, 2, 3]"
+    )
+
+    # Assert -- which table survived under the collided key.
+    observed_cells = [
+        int(out[key].iloc[0, 0]) for key in EXPECTED_OCCUPIED_SUFFIX_KEYS
+    ]
+    assert observed_cells == EXPECTED_OCCUPIED_SUFFIX_CELLS, (
+        f"the collided key currently holds the LAST writer's data; expected "
+        f"cells {EXPECTED_OCCUPIED_SUFFIX_CELLS} (table 2's 2 is missing) "
+        f"but got {observed_cells}"
     )
 
 
-def test_duplicate_name_probes_past_consecutive_occupied_keys_without_loss() -> None:
-    """The ordinal probe steps over EVERY occupied candidate, not just one.
+def test_repeats_against_consecutive_occupied_suffixes_drop_two_tables() -> None:
+    """5 tables named X / X_2 / X_3 / X / X return only 3 frames.
 
-    Upstream envelope, in order: ``PlayByPlay`` (cell ``1``),
-    ``PlayByPlay_2`` (cell ``2``), ``PlayByPlay_3`` (cell ``3``),
-    ``PlayByPlay`` (cell ``4``). Hand-derived in
-    :data:`EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS`: the first three names
-    are distinct and take bare keys, then the repeat's ordinal must step
-    over TWO occupied candidates (``play_by_play_2``, then
-    ``play_by_play_3``) before landing on the free ``play_by_play_4``.
+    The compounding form of the same defect, hand-derived in
+    :data:`EXPECTED_CONSECUTIVE_SUFFIX_KEYS` and
+    :data:`EXPECTED_CONSECUTIVE_SUFFIX_CELLS`: the ordinal advances once
+    per repeat (``2``, then ``3``) without ever checking occupancy, so the
+    fourth table displaces ``x_2`` and the fifth displaces ``x_3``. Three
+    keys for five upstream tables, with cells ``[1, 4, 5]`` — the absent
+    ``2`` and ``3`` are the two lost tables.
 
-    Mutation detected: a one-shot retry — checking the candidate once and
-    incrementing a single time instead of looping — which would land back
-    on the occupied ``play_by_play_3`` and destroy table 3. That mutation
-    passes
-    :func:`test_duplicate_name_whose_generated_key_is_occupied_keeps_every_table`
-    (where a single step is enough) and is caught only here.
+    Mutations detected: any change to the per-repeat ordinal progression
+    (a fixed suffix would collapse both repeats onto one key, yielding two
+    frames and cells ``[1, 5]``); resetting ``seen_names`` per table; and
+    keying a repeat off the bare name. As with its sibling above, applying
+    the loss-free probe fix fails this test by design.
     """
-    # Arrange -- two consecutive generated candidates are pre-occupied.
+    # Arrange -- two bare siblings occupy the first two generated ordinals.
     payload: Dict[str, Any] = {
         "resultSets": [
-            {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[1]]},
-            {"name": "PlayByPlay_2", "headers": ["A"], "rowSet": [[2]]},
-            {"name": "PlayByPlay_3", "headers": ["A"], "rowSet": [[3]]},
-            {"name": "PlayByPlay", "headers": ["A"], "rowSet": [[4]]},
+            {"name": "X", "headers": ["A"], "rowSet": [[1]]},
+            {"name": "X_2", "headers": ["A"], "rowSet": [[2]]},
+            {"name": "X_3", "headers": ["A"], "rowSet": [[3]]},
+            {"name": "X", "headers": ["A"], "rowSet": [[4]]},
+            {"name": "X", "headers": ["A"], "rowSet": [[5]]},
         ]
     }
-    expected_table_count = len(payload["resultSets"])
 
     # Act
     out = normalize_result_sets(payload)
 
-    # Assert -- loss-free: four tables in, four frames out.
-    assert len(out) == expected_table_count, (
-        f"the uniquifier must never drop a table; the envelope declared "
-        f"{expected_table_count} result sets but normalize_result_sets "
-        f"returned {len(out)} frames ({list(out.keys())})"
-    )
-
     # Assert -- the complete ordered key list.
-    assert list(out.keys()) == EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS, (
-        f"the probe must advance past every occupied candidate; expected "
-        f"{EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS} but got {list(out.keys())}"
+    assert list(out.keys()) == EXPECTED_CONSECUTIVE_SUFFIX_KEYS, (
+        f"consecutive occupied suffixes currently yield "
+        f"{EXPECTED_CONSECUTIVE_SUFFIX_KEYS}; got {list(out.keys())}"
     )
 
-    # Assert -- every table's own data survives under its own key.
+    # Assert -- the loss, quantified.
+    assert len(out) == len(EXPECTED_CONSECUTIVE_SUFFIX_KEYS), (
+        f"expected {len(EXPECTED_CONSECUTIVE_SUFFIX_KEYS)} frames; "
+        f"got {len(out)}"
+    )
+    assert len(out) < CONSECUTIVE_SUFFIX_TABLE_COUNT, (
+        f"this test exists because TWO tables are LOST: "
+        f"{CONSECUTIVE_SUFFIX_TABLE_COUNT} tables were supplied but only "
+        f"{len(out)} frames returned. If this assertion fails because "
+        f"len(out) == {CONSECUTIVE_SUFFIX_TABLE_COUNT}, the loss-free probe "
+        f"fix has been applied and this test must be updated to expect "
+        f"['x', 'x_2', 'x_3', 'x_4', 'x_5'] with cells [1, 2, 3, 4, 5]"
+    )
+
+    # Assert -- which tables survived, in key order.
     observed_cells = [
-        int(out[key].iloc[0, 0]) for key in EXPECTED_CONSECUTIVE_OCCUPANCY_KEYS
+        int(out[key].iloc[0, 0]) for key in EXPECTED_CONSECUTIVE_SUFFIX_KEYS
     ]
-    assert observed_cells == EXPECTED_CONSECUTIVE_OCCUPANCY_CELLS, (
-        f"each key must map to its OWN table's data; expected cells "
-        f"{EXPECTED_CONSECUTIVE_OCCUPANCY_CELLS} but got {observed_cells}"
+    assert observed_cells == EXPECTED_CONSECUTIVE_SUFFIX_CELLS, (
+        f"each displaced slot currently holds its LAST writer's data; "
+        f"expected cells {EXPECTED_CONSECUTIVE_SUFFIX_CELLS} (tables 2 and 3 "
+        f"are missing) but got {observed_cells}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Malformed envelopes — the seven exact ValueError messages
+# Malformed envelopes — the ten exact ValueError messages
 # ---------------------------------------------------------------------------
 #
 # The five guards exercised here -- ``_extract_tables`` (L155),
@@ -748,6 +807,15 @@ def test_duplicate_name_probes_past_consecutive_occupied_keys_without_loss() -> 
 # (L320) -- are all reached exclusively through the public
 # ``normalize_result_sets``; no private helper is imported and no
 # production source file is touched.
+#
+# Ten envelopes cover those five guards because two of them are
+# multi-condition: ``_require_str`` (L232) rejects an absent, a non-string
+# AND an empty ``name`` in one ``or``-joined predicate, and
+# ``_require_list`` (L265) rejects both an absent key and a wrong TYPE.
+# Each condition is independently mutable, so each gets its own envelope
+# and its own exact message — the type name in the message is what
+# distinguishes them (``NoneType`` / ``int`` / ``str`` for ``name``;
+# ``NoneType`` / ``dict`` for ``rowSet``).
 #
 # Guard ORDER inside the per-table loop (L129-140) determines which
 # envelope trips which branch, so the shared fixture's shapes are
@@ -811,7 +879,7 @@ def test_malformed_envelope_raises_valueerror_with_exact_message(
 ) -> None:
     """Each malformed envelope raises ``ValueError`` carrying its verbatim message.
 
-    The seven expected strings in :data:`EXPECTED_MESSAGES` are the
+    The ten expected strings in :data:`EXPECTED_MESSAGES` are the
     production f-strings rendered by hand, each annotated with its source
     line. ``re.escape`` keeps the regex literal so the punctuation in the
     messages cannot silently relax the pattern. The error class is pinned

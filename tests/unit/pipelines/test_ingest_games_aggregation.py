@@ -26,16 +26,34 @@ lines 794-799), then increments ``pipeline_rows_written_total`` with the
   correct value sequence;
 * one ordered ``checkpoint.mark_completed`` per game and exactly one
   ``get_pending`` probe carrying the full enumerated tuple;
-* the zero-enumerated-games short circuit -- no write, no mark, no metric
-  increment, no upstream fetch, and **no prior-session buffer load**:
-  neither ``_load_existing_games`` nor ``_load_existing_pbp`` is reached,
-  so an all-checkpointed run performs no artifact stat and no
-  :func:`pandas.read_csv`. Its positive control proves each loader *does*
-  run exactly once, with the writer's output directory and the full
-  pending list, as soon as a game is pending;
+* the zero-enumerated-games short circuit -- no write, no mark, no
+  upstream fetch, **complete metric silence** (the entire ``metrics.inc``
+  call list is empty, not merely its row-written partition), and **no
+  prior-session buffer load**: neither ``_load_existing_games`` nor
+  ``_load_existing_pbp`` is reached, so an all-checkpointed run performs
+  no artifact stat and no :func:`pandas.read_csv`. Its positive control
+  proves each loader *does* run exactly once, with the writer's output
+  directory and the full pending list, as soon as a game is pending;
 * the degenerate-frame boundary -- a zero-row payload still produces a
   write, still checkpoints, still increments the counter with ``n=0`` under
-  its own artifact label, and is **not** swallowed by the Rule 6 handler.
+  its own artifact label, and is **not** swallowed by the Rule 6 handler;
+* the **join semantics** of the cumulative concatenation, which the
+  single-schema mini-season cannot express: two games declaring *disjoint*
+  stat columns (``PTS`` and ``REB``) must widen the artifact to the outer
+  column union ``['season', 'GAME_ID', 'PLAYER_ID', 'PTS', 'REB']`` at
+  shape ``(3, 5)``, with complementary null masks, both stat columns
+  upcast to ``float64``, and the per-column totals ``58.0`` and ``11.0``
+  intact -- an inner join would silently discard both stat columns while
+  leaving every row count correct;
+* the **continuation** contract past an empty contributor: a zero-row
+  declared-schema game followed by a 2-row game writes ``[0, 2]``
+  cumulative rows, counts ``[0, 2]``, marks both games, and keeps the
+  union's columns ``object`` -- the one observable trace that the empty
+  frame is still in the buffer rather than having been dropped from it;
+* the empty-**mapping** fallback of ``_select_primary_df`` -- an exactly
+  ``(0, 0)`` frame with no columns and no index, which is unreachable
+  through ``run`` (the normalizer rejects a table-less envelope first) and
+  is therefore exercised directly through the pipeline module's namespace.
 
 Two of those contracts are observable only in the log stream, so a
 handwritten :class:`logging.LoggerAdapter` spy is injected alongside the
@@ -159,7 +177,8 @@ Rule 6 is deliberately NOT re-tested here
 -----------------------------------------
 Per-game failure isolation is already covered by
 ``test_ingest_games.py::TestRule6FailSafe``. This module adds no new
-Rule 6 error case. The boundary tests do additionally assert that
+Rule 6 error case. The boundary, schema-drift and continuation tests do
+additionally assert that
 ``games_failed_total`` was **never** incremented: that is negative-space
 evidence, alongside their recorded write, row-increment and
 checkpoint-mark assertions, that a degenerate-but-valid payload flowed
@@ -177,10 +196,14 @@ production, but only to compose :class:`pathlib.Path` values.) The only
 aggregation primitives are the two ``pd.concat`` calls this module
 targets. So there is no divisor to drive to zero, and none is invented
 here. The requirement is honoured through faithful analogues, of which
-this module supplies three: the zero-enumerated-games short circuit (the
+this module supplies five: the zero-enumerated-games short circuit (the
 loop body never executes), cumulative row-count conservation (exactly 7
-and 8), and per-game versus cumulative counter semantics (the
-``[2, 4, 3, 1, 2, 3]`` sequence).
+and 8), per-game versus cumulative counter semantics (the
+``[2, 4, 3, 1, 2, 3]`` sequence), disjoint-column concatenation with null
+fill and ``float64`` upcast (the ``PTS``/``REB`` union), and
+concatenation in which one contributing frame has zero rows (the
+``object``-dtype asymmetry). The remaining analogue -- an empty ``rowSet``
+in the single-shot pipelines -- belongs to their own test modules.
 """
 
 from __future__ import annotations
@@ -408,6 +431,164 @@ EXPECTED_SKIP_COMPLETION_EVENTS = [
     ),
 ]
 
+# ---------------------------------------------------------------------------
+# Hand-derived expectations -- SCHEMA DRIFT between contributing games
+# ---------------------------------------------------------------------------
+#
+# The mini-season fixtures deliberately share one box-score schema, which
+# makes the concatenation's JOIN SEMANTICS unobservable: with identical
+# columns an outer union, an inner join and a first-frame projection are
+# numerically identical. The two scenarios below supply the heterogeneity
+# that separates them, using locally built envelopes so the shared fixture
+# surface does not grow.
+#
+# Scenario 1 -- two games whose box scores declare DIFFERENT stat columns:
+#   G1 headers ["GAME_ID", "PLAYER_ID", "PTS"] with 2 rows
+#        ("0022500001", 203999,  30) and ("0022500001", 1629029, 28)
+#   G2 headers ["GAME_ID", "PLAYER_ID", "REB"] with 1 row
+#        ("0022500002", 1628369, 11)
+# Per-frame, ``_ensure_game_columns`` inserts ``season`` at index 0 and
+# does NOT insert ``game_id`` (``GAME_ID`` already matches case
+# insensitively), so the two contributed frames are
+# ['season','GAME_ID','PLAYER_ID','PTS'] and
+# ['season','GAME_ID','PLAYER_ID','REB'].
+# ---------------------------------------------------------------------------
+
+#: First write of the drift scenario -- G1 alone, before any union exists.
+#: 2 payload columns + ``GAME_ID`` + the inserted ``season`` = 4.
+EXPECTED_DRIFT_FIRST_COLUMNS = ["season", "GAME_ID", "PLAYER_ID", "PTS"]
+EXPECTED_DRIFT_FIRST_SHAPE = (2, 4)
+
+#: Second write -- the OUTER UNION of both frames' columns, in FIRST-SEEN
+#: order: G1's four columns unchanged, then G2's ``REB`` appended because
+#: it is new. ``pd.concat`` defaults to ``join="outer", sort=False``, so no
+#: column is dropped and none is alphabetised.
+#: An inner join would yield ['season','GAME_ID','PLAYER_ID'] and a
+#: first-frame projection would yield EXPECTED_DRIFT_FIRST_COLUMNS -- both
+#: silently discarding a stat column that upstream actually returned.
+EXPECTED_DRIFT_UNION_COLUMNS = [
+    "season", "GAME_ID", "PLAYER_ID", "PTS", "REB",
+]
+
+#: Union shape: 2 + 1 = 3 rows; 5 union columns.
+EXPECTED_DRIFT_UNION_SHAPE = (3, 5)
+
+#: Cumulative games-CSV write sizes for the drift scenario: 2 ; 2+1=3.
+EXPECTED_DRIFT_CUMULATIVE_GAMES_ROWS = [2, 3]
+
+#: Per-game games-artifact increments: G1 2 rows, G2 1 row.
+EXPECTED_DRIFT_GAMES_INCREMENTS = [2, 1]
+
+#: The play-by-play half reuses the mini-season envelopes for G1 and G2, so
+#: its cumulative sizes are 4 ; 4+1=5 and its increments are 4 then 1.
+EXPECTED_DRIFT_CUMULATIVE_PBP_ROWS = [4, 5]
+EXPECTED_DRIFT_PBP_INCREMENTS = [4, 1]
+
+#: dtypes of the union frame, column by column. ``season`` and ``GAME_ID``
+#: hold strings -> ``object``. ``PLAYER_ID`` is an int in every row with no
+#: hole -> ``int64``. ``PTS`` and ``REB`` each acquire a hole where the
+#: other game's rows had no such column, and ``int64`` cannot hold a
+#: missing value, so both upcast to ``float64`` -- the same upcast rule the
+#: normalizer's dtype tests pin for a ``None`` among integers.
+EXPECTED_DRIFT_DTYPES: Dict[str, str] = {
+    "season": "object",
+    "GAME_ID": "object",
+    "PLAYER_ID": "int64",
+    "PTS": "float64",
+    "REB": "float64",
+}
+
+#: Null masks of the two disjoint stat columns, in row order. G1's two rows
+#: declared no ``REB`` and G2's single row declared no ``PTS``, so the fill
+#: is exactly complementary. NaN cannot be compared by equality, which is
+#: why the mask is asserted alongside the surviving values below.
+EXPECTED_DRIFT_PTS_NULL_MASK = [False, False, True]
+EXPECTED_DRIFT_REB_NULL_MASK = [True, True, False]
+
+#: The non-null values of each stat column, in row order, as floats after
+#: the upcast: PTS 30 and 28 from G1; REB 11 from G2.
+EXPECTED_DRIFT_PTS_PRESENT = [30.0, 28.0]
+EXPECTED_DRIFT_REB_PRESENT = [11.0]
+
+#: Column sums, which skip the NaN fill: 30+28=58 and 11.
+EXPECTED_DRIFT_PTS_TOTAL = 58.0
+EXPECTED_DRIFT_REB_TOTAL = 11.0
+
+#: Row identity across the union, in concatenation order: G1's two players
+#: then G2's one. A row-losing or row-reordering join fails here even if the
+#: column list survived.
+EXPECTED_DRIFT_PLAYER_IDS = [203999, 1629029, 1628369]
+EXPECTED_DRIFT_GAME_IDS = ["0022500001", "0022500001", "0022500002"]
+
+# ---------------------------------------------------------------------------
+# Hand-derived expectations -- a ZERO-ROW contributor, then a non-empty one
+# ---------------------------------------------------------------------------
+#
+# Scenario 2 -- the continuation contract. G1's box score declares the full
+# schema but returns NO rows; G2 returns 2 rows under the SAME schema:
+#   G1 headers ["GAME_ID", "PLAYER_ID", "PTS"] with rowSet []
+#   G2 same headers with ("0022500002", 1628369, 31) and
+#      ("0022500002", 201939, 22)
+# The pipeline must not stop, skip or shrink because the first contributor
+# was empty: it writes the header-only artifact, keeps that frame in the
+# buffer, and the next game's rows must appear in the cumulative artifact.
+# ---------------------------------------------------------------------------
+
+#: Both contributed frames declare the same columns, so the union is that
+#: same list: 2 payload columns + ``GAME_ID`` + inserted ``season``.
+EXPECTED_CONTINUATION_COLUMNS = ["season", "GAME_ID", "PLAYER_ID", "PTS"]
+
+#: First write: the zero-row contributor alone -> 0 rows, 4 columns.
+EXPECTED_CONTINUATION_FIRST_SHAPE = (0, 4)
+
+#: Second write: 0 + 2 = 2 rows, still 4 columns.
+EXPECTED_CONTINUATION_FINAL_SHAPE = (2, 4)
+
+#: dtypes of the second write -- the asymmetric case. A zero-row frame
+#: built by ``pd.DataFrame(columns=headers)`` types every column
+#: ``object``, and concatenating an ``object`` column with an ``int64``
+#: column yields ``object``, so ``PLAYER_ID`` and ``PTS`` stay ``object``
+#: even though every surviving cell is a Python ``int``. That is what makes
+#: this scenario detect a "drop empty frames from the buffer" optimisation:
+#: without the empty contributor both columns would infer ``int64``.
+EXPECTED_CONTINUATION_DTYPES: Dict[str, str] = {
+    "season": "object",
+    "GAME_ID": "object",
+    "PLAYER_ID": "object",
+    "PTS": "object",
+}
+
+#: Cumulative games-CSV write sizes: 0 ; 0+2=2. The leading zero is the
+#: header-only write a short circuit would omit entirely.
+EXPECTED_CONTINUATION_CUMULATIVE_GAMES_ROWS = [0, 2]
+
+#: Per-game games-artifact increments: the empty game reports 0 verbatim,
+#: then G2 reports its own 2 -- never the cumulative 2 for both.
+EXPECTED_CONTINUATION_GAMES_INCREMENTS = [0, 2]
+
+#: The surviving rows, in order, with their values held as Python ints
+#: inside the object columns: no coercion, no fill, no rounding.
+EXPECTED_CONTINUATION_PLAYER_IDS = [1628369, 201939]
+EXPECTED_CONTINUATION_PTS = [31, 22]
+
+#: PTS total of the continuation frame: 31+22 = 53.
+EXPECTED_CONTINUATION_PTS_TOTAL = 53
+
+# ---------------------------------------------------------------------------
+# Hand-derived expectations -- the empty result-set MAPPING fallback
+# ---------------------------------------------------------------------------
+
+#: ``_select_primary_df({})`` returns ``pd.DataFrame()``: a genuine 0x0
+#: frame with no columns and no index. The mapping is empty only when the
+#: normalizer produced no table at all, which cannot be reached through
+#: ``run`` -- the normalizer raises for such an envelope and the Rule 6
+#: handler swallows it -- so this branch is asserted directly on the
+#: helper, exactly as the pre-existing ``test_ingest_players.py``
+#: ``TestSelectPrimaryDf`` suite does for the sibling pipeline's copy.
+EXPECTED_EMPTY_MAPPING_SHAPE = (0, 0)
+EXPECTED_EMPTY_MAPPING_COLUMNS: List[str] = []
+EXPECTED_EMPTY_MAPPING_INDEX: List[Any] = []
+
 
 # ---------------------------------------------------------------------------
 # Module-local helpers
@@ -537,6 +718,64 @@ def _row_written_emissions(
         labels = call.args[1] if len(call.args) > 1 else None
         emissions.append((labels, call.kwargs.get("n")))
     return emissions
+
+
+def _dtype_map(df: pd.DataFrame) -> Dict[str, str]:
+    """Return ``{column name: dtype name}`` for a recorded frame.
+
+    Comparing ``df.dtypes`` to another Series with ``==`` yields a boolean
+    Series rather than a bool, which an ``assert`` would treat as truthy
+    whenever it is non-empty -- a classic silent pass. Reducing the dtypes
+    to a plain ``{str: str}`` mapping keeps the comparison a genuine
+    whole-collection equality, and preserves column order because
+    ``DataFrame.dtypes`` iterates in column order.
+    """
+    return {str(column): str(dtype) for column, dtype in df.dtypes.items()}
+
+
+def _boxscore_payload(
+    game_id: str,
+    headers: List[str],
+    rows: List[List[Any]],
+) -> Dict[str, Any]:
+    """Build a ``boxscoretraditionalv2`` envelope with arbitrary columns.
+
+    The general form of :func:`_zero_row_boxscore_payload` (which is the
+    specialised empty-``rowSet`` case the two frozen boundary tests use).
+    It exists so the schema-drift scenarios can declare DIFFERENT headers
+    per game -- something the shared mini-season fixtures deliberately do
+    not do, because their single common schema is what keeps their
+    cumulative arithmetic simple. Building these envelopes locally honours
+    the AAP's rule that a single-module concern stays out of the shared
+    fixture surface.
+
+    The single ``resultSets`` entry is named ``"PlayerStats"`` to match the
+    mini-season envelopes, so ``_select_primary_df`` picks it as the
+    primary table exactly as it does in production.
+
+    Parameters
+    ----------
+    game_id:
+        The ``GAME_ID`` this envelope answers for; echoed into
+        ``parameters`` so the envelope reads like a real response.
+    headers:
+        Declared column names, passed through verbatim as the frame's
+        columns.
+    rows:
+        The ``rowSet`` rows, each of which must be ``len(headers)`` wide or
+        the normalizer will reject the envelope.
+    """
+    return {
+        "resource": _BOXSCORE_ENDPOINT,
+        "parameters": {"GameID": game_id},
+        "resultSets": [
+            {
+                "name": "PlayerStats",
+                "headers": list(headers),
+                "rowSet": [list(row) for row in rows],
+            }
+        ],
+    }
 
 
 def _zero_row_boxscore_payload(
@@ -1205,6 +1444,11 @@ def test_zero_enumerated_games_short_circuits_before_any_aggregation(
       ``test_buffer_loaders_run_once_each_after_the_pending_guard``, which
       proves the very same patch seam records invocations when games ARE
       pending.
+    * **Emitting ANY counter on the skip path** -- a stray
+      ``games_failed_total``, a new skip counter, or a row-written
+      increment whose counter NAME was mutated. A name-filtered assertion
+      cannot see any of these, so the whole ``metrics.inc`` call list is
+      asserted empty as well.
     """
     # --- Arrange -------------------------------------------------------
     # Enumeration returns nothing; the payload mappings are still supplied so
@@ -1266,6 +1510,21 @@ def test_zero_enumerated_games_short_circuits_before_any_aggregation(
         f"no {_ROWS_WRITTEN_COUNTER} increment may fire when the "
         f"aggregation loop never runs; got "
         f"{_row_written_increments(metrics_mock)}"
+    )
+
+    # --- Assert: COMPLETE metric silence, not just row-written silence --
+    # The assertion above filters by counter name, so ANY other counter --
+    # games_failed_total, a newly introduced skip counter, or a mislabelled
+    # row-written increment whose name was mutated -- passes through it
+    # invisibly. Asserting the whole recorded call list closes that gap:
+    # the skip path must emit nothing at all, so the only faithful
+    # expectation is the empty list. ``metrics.inc`` is the sole method the
+    # pipeline calls on its metrics collaborator, which is what makes the
+    # unfiltered call list a complete record of its metric behaviour.
+    assert metrics_mock.inc.call_args_list == [], (
+        f"the all-checkpointed skip path must be metrically SILENT -- no "
+        f"counter of any name or label may be incremented; got "
+        f"{metrics_mock.inc.call_args_list!r}"
     )
 
     # --- Assert: the run terminated through the SKIP branch ------------
@@ -1602,4 +1861,453 @@ def test_zero_row_frame_with_declared_headers_keeps_payload_columns(
     assert checkpoint.marks == [(config.DOMAIN_GAMES, game_id)], (
         f"a header-only frame must still be checkpointed as "
         f"{[(config.DOMAIN_GAMES, game_id)]!r}; got {checkpoint.marks!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test H -- schema drift: disjoint stat columns concatenate into their union
+# ---------------------------------------------------------------------------
+#
+# Every mini-season frame declares the same four columns, which makes the
+# concatenation's JOIN SEMANTICS unobservable: with identical schemas an
+# outer union, an inner join and a projection onto the first frame's
+# columns all produce the same artifact. Upstream schemas do drift, though
+# -- a stat column can appear for one game and not another -- and when they
+# do, the choice of join decides whether a column is silently discarded.
+# This test supplies the heterogeneity that separates the three.
+# ---------------------------------------------------------------------------
+
+
+def test_heterogeneous_box_score_schemas_concat_into_the_outer_column_union(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_writer,
+    recording_checkpoint,
+    mini_season_playbyplay_payloads: Dict[str, Any],
+    mini_season_game_ids: List[str],
+) -> None:
+    """Two games declaring PTS and REB respectively produce a 5-column, 3-row union.
+
+    Hand-derived in :data:`EXPECTED_DRIFT_UNION_COLUMNS` and its siblings:
+    G1 contributes ['season','GAME_ID','PLAYER_ID','PTS'] with 2 rows and
+    G2 contributes ['season','GAME_ID','PLAYER_ID','REB'] with 1 row, so the
+    cumulative artifact is the outer union in first-seen order with shape
+    (3, 5). Each stat column acquires a complementary hole -- ``PTS`` is
+    missing for G2's row, ``REB`` for G1's two -- and because ``int64``
+    cannot carry a missing value both upcast to ``float64``, exactly as a
+    ``None`` among integers does in the normalizer.
+
+    Mutations detected:
+
+    * **``pd.concat(..., join="inner")``** -- the column list collapses to
+      ['season','GAME_ID','PLAYER_ID'] and both stat columns vanish from
+      every artifact, while the row count stays 3 and every cumulative size
+      stays correct. Only the column-list and value assertions see it.
+    * **Projecting the combined frame onto the first frame's columns**
+      (``combined[games_buffer[0].columns]``) -- ``REB`` is dropped and G2's
+      rebound total silently becomes unreportable.
+    * **Writing only the latest frame** -- the second write would carry 1
+      row and G1's rows would be gone.
+    * **A fill mutation** such as ``fillna(0)`` -- the null masks and the
+      column sums both change, turning "this game reported no rebounds" into
+      "this game reported zero rebounds".
+    """
+    # --- Arrange -------------------------------------------------------
+    # Two games only: the third mini-season game is unnecessary here and
+    # would add a second union step without adding a distinguishable fact.
+    game_a, game_b = mini_season_game_ids[0], mini_season_game_ids[1]
+    _patch_mini_season_enumerate(monkeypatch, [game_a, game_b])
+    client = _MiniSeasonClient(
+        boxscore_payloads={
+            # G1: PTS 30 + 28 = 58 across 2 rows.
+            game_a: _boxscore_payload(
+                game_a,
+                ["GAME_ID", "PLAYER_ID", "PTS"],
+                [
+                    [game_a, 203999, 30],
+                    [game_a, 1629029, 28],
+                ],
+            ),
+            # G2: a DIFFERENT stat column, REB 11, across 1 row.
+            game_b: _boxscore_payload(
+                game_b,
+                ["GAME_ID", "PLAYER_ID", "REB"],
+                [
+                    [game_b, 1628369, 11],
+                ],
+            ),
+        },
+        playbyplay_payloads={
+            game_a: mini_season_playbyplay_payloads[game_a],
+            game_b: mini_season_playbyplay_payloads[game_b],
+        },
+    )
+    writer = recording_writer()
+    checkpoint = recording_checkpoint()
+    metrics_mock = MagicMock()
+
+    # --- Act -----------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+        metrics=metrics_mock,
+    )
+
+    # --- Assert: cumulative write sizes still conserve every row -------
+    games_writes = _writes_named(writer, config.CSV_GAMES)
+    games_sizes = [w["rows"] for w in games_writes]
+    assert games_sizes == EXPECTED_DRIFT_CUMULATIVE_GAMES_ROWS, (
+        f"schema drift must not cost a row: cumulative games sizes must be "
+        f"{EXPECTED_DRIFT_CUMULATIVE_GAMES_ROWS} (2; 2+1=3); "
+        f"got {games_sizes}"
+    )
+    pbp_sizes = [w["rows"] for w in _writes_named(writer, config.CSV_PLAY_BY_PLAY)]
+    assert pbp_sizes == EXPECTED_DRIFT_CUMULATIVE_PBP_ROWS, (
+        f"the play-by-play half is schema-stable and must read "
+        f"{EXPECTED_DRIFT_CUMULATIVE_PBP_ROWS} (4; 4+1=5); got {pbp_sizes}"
+    )
+
+    # --- Assert: the FIRST write carries only G1's schema --------------
+    first_df = games_writes[0]["df"]
+    assert list(first_df.columns) == EXPECTED_DRIFT_FIRST_COLUMNS, (
+        f"before the union exists the artifact must carry G1's columns "
+        f"{EXPECTED_DRIFT_FIRST_COLUMNS}; got {list(first_df.columns)}"
+    )
+    assert first_df.shape == EXPECTED_DRIFT_FIRST_SHAPE, (
+        f"G1 alone must be {EXPECTED_DRIFT_FIRST_SHAPE}; "
+        f"got {first_df.shape}"
+    )
+
+    # --- Assert: the SECOND write is the outer union, in order ---------
+    union_df = games_writes[-1]["df"]
+    assert list(union_df.columns) == EXPECTED_DRIFT_UNION_COLUMNS, (
+        f"disjoint schemas must widen to the outer union in first-seen "
+        f"order {EXPECTED_DRIFT_UNION_COLUMNS} -- an inner join would drop "
+        f"both stat columns; got {list(union_df.columns)}"
+    )
+    assert union_df.shape == EXPECTED_DRIFT_UNION_SHAPE, (
+        f"the union must be {EXPECTED_DRIFT_UNION_SHAPE} (2+1 rows; 5 union "
+        f"columns); got {union_df.shape}"
+    )
+
+    # --- Assert: dtypes, including both float64 upcasts ---------------
+    observed_dtypes = _dtype_map(union_df)
+    assert observed_dtypes == EXPECTED_DRIFT_DTYPES, (
+        f"a column holding a hole cannot stay int64: expected "
+        f"{EXPECTED_DRIFT_DTYPES}; got {observed_dtypes}"
+    )
+
+    # --- Assert: the null fill is exactly complementary ---------------
+    pts_mask = union_df["PTS"].isna().tolist()
+    assert pts_mask == EXPECTED_DRIFT_PTS_NULL_MASK, (
+        f"PTS must be null only for the game that never declared it; "
+        f"expected {EXPECTED_DRIFT_PTS_NULL_MASK}; got {pts_mask}"
+    )
+    reb_mask = union_df["REB"].isna().tolist()
+    assert reb_mask == EXPECTED_DRIFT_REB_NULL_MASK, (
+        f"REB must be null only for the rows that never declared it; "
+        f"expected {EXPECTED_DRIFT_REB_NULL_MASK}; got {reb_mask}"
+    )
+
+    # --- Assert: the surviving values, and their totals ---------------
+    # NaN never equals NaN, so the present values are compared with the
+    # nulls dropped and the masks above pin where the holes are.
+    pts_present = union_df["PTS"].dropna().tolist()
+    assert pts_present == EXPECTED_DRIFT_PTS_PRESENT, (
+        f"G1's points must survive the union verbatim as "
+        f"{EXPECTED_DRIFT_PTS_PRESENT}; got {pts_present}"
+    )
+    reb_present = union_df["REB"].dropna().tolist()
+    assert reb_present == EXPECTED_DRIFT_REB_PRESENT, (
+        f"G2's rebounds must survive the union verbatim as "
+        f"{EXPECTED_DRIFT_REB_PRESENT}; got {reb_present}"
+    )
+    assert float(union_df["PTS"].sum()) == EXPECTED_DRIFT_PTS_TOTAL, (
+        f"PTS must total {EXPECTED_DRIFT_PTS_TOTAL} (30+28, the NaN skipped); "
+        f"got {float(union_df['PTS'].sum())}"
+    )
+    assert float(union_df["REB"].sum()) == EXPECTED_DRIFT_REB_TOTAL, (
+        f"REB must total {EXPECTED_DRIFT_REB_TOTAL}; "
+        f"got {float(union_df['REB'].sum())}"
+    )
+
+    # --- Assert: row identity and order across the union --------------
+    observed_players = [int(v) for v in union_df["PLAYER_ID"].tolist()]
+    assert observed_players == EXPECTED_DRIFT_PLAYER_IDS, (
+        f"the union must keep every row in concatenation order, so "
+        f"PLAYER_ID must read {EXPECTED_DRIFT_PLAYER_IDS}; "
+        f"got {observed_players}"
+    )
+    observed_games = [str(v) for v in union_df["GAME_ID"].tolist()]
+    assert observed_games == EXPECTED_DRIFT_GAME_IDS, (
+        f"each row must stay attributed to its own game: GAME_ID must read "
+        f"{EXPECTED_DRIFT_GAME_IDS}; got {observed_games}"
+    )
+
+    # --- Assert: per-game counters and checkpoint marks ---------------
+    games_increments = _row_written_increments(metrics_mock, config.CSV_GAMES)
+    assert games_increments == EXPECTED_DRIFT_GAMES_INCREMENTS, (
+        f"the counter must report each game's own row count "
+        f"{EXPECTED_DRIFT_GAMES_INCREMENTS}, not the cumulative "
+        f"{EXPECTED_DRIFT_CUMULATIVE_GAMES_ROWS}; got {games_increments}"
+    )
+    pbp_increments = _row_written_increments(
+        metrics_mock, config.CSV_PLAY_BY_PLAY,
+    )
+    assert pbp_increments == EXPECTED_DRIFT_PBP_INCREMENTS, (
+        f"play-by-play increments must be {EXPECTED_DRIFT_PBP_INCREMENTS}; "
+        f"got {pbp_increments}"
+    )
+    expected_marks = [
+        (config.DOMAIN_GAMES, game_a),
+        (config.DOMAIN_GAMES, game_b),
+    ]
+    assert checkpoint.marks == expected_marks, (
+        f"both games must be checkpointed in order as {expected_marks!r}; "
+        f"got {checkpoint.marks!r}"
+    )
+    failure_calls = _counter_calls(metrics_mock, _GAMES_FAILED_COUNTER)
+    assert failure_calls == [], (
+        f"drifting schemas are valid input, not a Rule 6 failure, so "
+        f"{_GAMES_FAILED_COUNTER} must never fire; got {failure_calls!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test I -- continuation: an EMPTY contributor must not cost the next game
+# ---------------------------------------------------------------------------
+#
+# The single-game boundary tests above (F and G) prove a zero-row game
+# still writes, still counts and still checkpoints. They cannot prove what
+# happens NEXT, because they enumerate one game only. This test adds the
+# contributor that follows: the empty frame stays in the buffer, and the
+# next game's rows must appear in the cumulative artifact alongside it.
+#
+# It also pins the dtype asymmetry AAP §0.4.2.4 names: an all-``object``
+# zero-row contributor keeps the union ``object`` instead of letting the
+# non-empty frame's ``int64`` win -- the one observable trace that the empty
+# frame is still in the buffer at all.
+# ---------------------------------------------------------------------------
+
+
+def test_zero_row_contributor_then_non_empty_game_keeps_both_writes_and_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_writer,
+    recording_checkpoint,
+    mini_season_playbyplay_payloads: Dict[str, Any],
+    mini_season_game_ids: List[str],
+) -> None:
+    """An empty first game then a 2-row second game writes 0 rows, then 2.
+
+    Hand-derived in :data:`EXPECTED_CONTINUATION_CUMULATIVE_GAMES_ROWS`:
+    the zero-row contributor produces a header-only 4-column write, and the
+    following game's 2 rows produce 0+2=2. Both games are counted (``n=0``
+    then ``n=2``) and both are checkpointed, so an empty upstream response
+    costs neither the artifact nor the next game's data.
+
+    The dtypes are the load-bearing detail: the zero-row frame types every
+    column ``object``, and an ``object`` column concatenated with an
+    ``int64`` one stays ``object``, so the surviving cells are Python ints
+    inside object columns -- asserted as values AND as types.
+
+    Mutations detected:
+
+    * **Skipping the write or the counter for an empty frame** -- the
+      leading ``0`` disappears from the write sizes and the increments.
+    * **Returning early on an empty primary frame** -- the second game is
+      never fetched, so its rows, its increment and its mark all vanish.
+    * **Dropping empty frames from the buffer before concatenating** -- the
+      row counts still read [0, 2] but the dtypes become ``int64``, which is
+      the only witness that the empty contributor was silently discarded.
+    * **A coercion or fill mutation** (``astype``, ``fillna``) -- the values
+      would no longer be the exact ints 31 and 22.
+    """
+    # --- Arrange -------------------------------------------------------
+    game_a, game_b = mini_season_game_ids[0], mini_season_game_ids[1]
+    _patch_mini_season_enumerate(monkeypatch, [game_a, game_b])
+    box_headers = ["GAME_ID", "PLAYER_ID", "PTS"]
+    client = _MiniSeasonClient(
+        boxscore_payloads={
+            # G1 declares the full schema and returns no rows at all.
+            game_a: _zero_row_boxscore_payload(game_a, headers=box_headers),
+            # G2 returns 2 rows: PTS 31 + 22 = 53.
+            game_b: _boxscore_payload(
+                game_b,
+                box_headers,
+                [
+                    [game_b, 1628369, 31],
+                    [game_b, 201939, 22],
+                ],
+            ),
+        },
+        playbyplay_payloads={
+            game_a: mini_season_playbyplay_payloads[game_a],
+            game_b: mini_season_playbyplay_payloads[game_b],
+        },
+    )
+    writer = recording_writer()
+    checkpoint = recording_checkpoint()
+    metrics_mock = MagicMock()
+
+    # --- Act -----------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+        metrics=metrics_mock,
+    )
+
+    # --- Assert: both writes happened, sized 0 then 2 -----------------
+    games_writes = _writes_named(writer, config.CSV_GAMES)
+    games_sizes = [w["rows"] for w in games_writes]
+    assert games_sizes == EXPECTED_CONTINUATION_CUMULATIVE_GAMES_ROWS, (
+        f"an empty contributor must still be written and must not cost the "
+        f"next game: cumulative sizes must be "
+        f"{EXPECTED_CONTINUATION_CUMULATIVE_GAMES_ROWS} (0; 0+2=2); "
+        f"got {games_sizes}"
+    )
+
+    # --- Assert: the header-only write kept its declared schema -------
+    first_df = games_writes[0]["df"]
+    assert list(first_df.columns) == EXPECTED_CONTINUATION_COLUMNS, (
+        f"the zero-row write must carry the declared schema "
+        f"{EXPECTED_CONTINUATION_COLUMNS}; got {list(first_df.columns)}"
+    )
+    assert first_df.shape == EXPECTED_CONTINUATION_FIRST_SHAPE, (
+        f"the zero-row write must be {EXPECTED_CONTINUATION_FIRST_SHAPE}; "
+        f"got {first_df.shape}"
+    )
+
+    # --- Assert: the cumulative frame carries the next game's rows ----
+    final_df = games_writes[-1]["df"]
+    assert list(final_df.columns) == EXPECTED_CONTINUATION_COLUMNS, (
+        f"the union of an empty and a non-empty frame with identical "
+        f"headers must stay {EXPECTED_CONTINUATION_COLUMNS}; "
+        f"got {list(final_df.columns)}"
+    )
+    assert final_df.shape == EXPECTED_CONTINUATION_FINAL_SHAPE, (
+        f"the cumulative frame must be "
+        f"{EXPECTED_CONTINUATION_FINAL_SHAPE} (0+2 rows; 4 columns); "
+        f"got {final_df.shape}"
+    )
+
+    # --- Assert: the object-dtype asymmetry ---------------------------
+    observed_dtypes = _dtype_map(final_df)
+    assert observed_dtypes == EXPECTED_CONTINUATION_DTYPES, (
+        f"an all-object zero-row contributor keeps the union object: "
+        f"expected {EXPECTED_CONTINUATION_DTYPES}; got {observed_dtypes}. "
+        f"int64 here would mean the empty frame was dropped from the buffer"
+    )
+
+    # --- Assert: the surviving values, verbatim and un-coerced --------
+    observed_players = final_df["PLAYER_ID"].tolist()
+    assert observed_players == EXPECTED_CONTINUATION_PLAYER_IDS, (
+        f"the second game's rows must survive as "
+        f"{EXPECTED_CONTINUATION_PLAYER_IDS}; got {observed_players}"
+    )
+    observed_pts = final_df["PTS"].tolist()
+    assert observed_pts == EXPECTED_CONTINUATION_PTS, (
+        f"points must survive verbatim as {EXPECTED_CONTINUATION_PTS}; "
+        f"got {observed_pts}"
+    )
+    observed_pts_types = [type(value).__name__ for value in observed_pts]
+    assert observed_pts_types == ["int", "int"], (
+        f"no coercion may occur inside the object column -- each cell must "
+        f"stay a Python int; got types {observed_pts_types}"
+    )
+    assert int(final_df["PTS"].sum()) == EXPECTED_CONTINUATION_PTS_TOTAL, (
+        f"points must total {EXPECTED_CONTINUATION_PTS_TOTAL} (31+22); "
+        f"got {int(final_df['PTS'].sum())}"
+    )
+
+    # --- Assert: both games counted and both checkpointed -------------
+    games_increments = _row_written_increments(metrics_mock, config.CSV_GAMES)
+    assert games_increments == EXPECTED_CONTINUATION_GAMES_INCREMENTS, (
+        f"the empty game must report its 0 verbatim and the next game its "
+        f"own 2, i.e. {EXPECTED_CONTINUATION_GAMES_INCREMENTS}; "
+        f"got {games_increments}"
+    )
+    expected_marks = [
+        (config.DOMAIN_GAMES, game_a),
+        (config.DOMAIN_GAMES, game_b),
+    ]
+    assert checkpoint.marks == expected_marks, (
+        f"an empty response is a completed game, and the next game must "
+        f"still run: marks must be {expected_marks!r}; "
+        f"got {checkpoint.marks!r}"
+    )
+    failure_calls = _counter_calls(metrics_mock, _GAMES_FAILED_COUNTER)
+    assert failure_calls == [], (
+        f"an empty rowSet is valid input, not a Rule 6 failure, so "
+        f"{_GAMES_FAILED_COUNTER} must never fire; got {failure_calls!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test J -- boundary: the empty-MAPPING fallback of _select_primary_df
+# ---------------------------------------------------------------------------
+#
+# ``_select_primary_df`` opens with ``if not dfs: return pd.DataFrame()``
+# (``pipelines/ingest_games.py`` lines 263-264). That branch is unreachable
+# through ``run``: an envelope carrying no table at all makes
+# ``normalize_result_sets`` raise -- verbatim, "Payload contains no result
+# sets (neither 'resultSets' nor 'resultSet' present, or both were empty)."
+# -- and the Rule 6 handler swallows that exception before the helper is
+# ever called, which is why the two boundary tests above reach a degenerate
+# FRAME (an empty ``rowSet``) rather than an empty MAPPING. Deleting the
+# fallback therefore leaves every other test in this module green while
+# ``next(iter({}))`` becomes a latent ``StopIteration`` for any future
+# caller.
+#
+# The helper is consequently exercised directly through the pipeline
+# module's namespace -- no ``from ... import _private``, no visibility
+# change, no test-only hook and no production edit. That is the boundary
+# assertion AAP §0.4.3 plans ("_select_primary_df on an empty table mapping
+# yields a 0x0 frame"), and it follows the pre-existing, frozen
+# ``tests/unit/pipelines/test_ingest_players.py::TestSelectPrimaryDf``
+# suite, which reaches the sibling pipeline's copy of this same helper the
+# same way and for the same stated reason.
+# ---------------------------------------------------------------------------
+
+
+def test_empty_result_set_mapping_selects_a_zero_by_zero_frame() -> None:
+    """``_select_primary_df({})`` returns a 0x0 DataFrame with no columns.
+
+    Hand-derived from the fallback statement itself: ``pd.DataFrame()``
+    constructs a frame with no columns, no index and therefore shape
+    (0, 0). Returning it -- rather than raising -- is what keeps the
+    downstream ``writer.write`` call total for a degenerate payload, so the
+    exact returned shape is a contract and not an implementation detail.
+
+    Mutations detected: deleting the ``if not dfs`` fallback, so
+    ``next(iter({}))`` raises ``StopIteration``; returning ``None`` or a
+    non-DataFrame sentinel, caught by the concrete-type assertion;
+    returning a pre-shaped frame such as ``pd.DataFrame(columns=["season"])``
+    or a Series, caught by the shape and ordered-column assertions.
+    """
+    # --- Act -----------------------------------------------------------
+    # Attribute access on the already-imported pipeline module: nothing is
+    # imported from a private name and nothing in production changes.
+    result = ingest_games._select_primary_df({})
+
+    # --- Assert: the concrete type, not merely DataFrame-like ---------
+    assert type(result) is pd.DataFrame, (
+        f"the empty-mapping fallback must return a concrete "
+        f"pandas.DataFrame; got {type(result).__name__}"
+    )
+
+    # --- Assert: the exact degenerate geometry ------------------------
+    assert result.shape == EXPECTED_EMPTY_MAPPING_SHAPE, (
+        f"an empty mapping must yield {EXPECTED_EMPTY_MAPPING_SHAPE}; "
+        f"got {result.shape}"
+    )
+    assert list(result.columns) == EXPECTED_EMPTY_MAPPING_COLUMNS, (
+        f"the fallback frame must declare no columns "
+        f"{EXPECTED_EMPTY_MAPPING_COLUMNS}; got {list(result.columns)}"
+    )
+    assert list(result.index) == EXPECTED_EMPTY_MAPPING_INDEX, (
+        f"the fallback frame must carry no rows "
+        f"{EXPECTED_EMPTY_MAPPING_INDEX}; got {list(result.index)}"
     )
