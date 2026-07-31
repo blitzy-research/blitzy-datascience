@@ -34,6 +34,20 @@ What this module pins
    .detail`` record at DEBUG, which the default
    :data:`config.LOG_LEVEL` of ``"INFO"`` discards, so detail is GATED
    rather than destroyed. Section F pins both halves.
+7. **The PROCESS boundary is confidential too.** Redacting the log sinks
+   is only half of the disclosure surface: the bare ``raise`` of item 1
+   deliberately propagates the exception, so ``python run.py <domain>``
+   used to hand it to CPython's top-level handler, which printed the
+   message, ``Traceback (most recent call last)`` and one absolute
+   ``File "<path>", line <n>`` frame per stack level onto ``stderr``.
+   ``run.py``'s ``if __name__ == "__main__"`` block therefore dispatches
+   through ``run.py::main``, which converts a propagated failure into a
+   silent ``SystemExit(1)`` (``from None``) after a redacted
+   ``run.aborted`` record, while leaving every deliberate exit status
+   (0 on success, ``ready``'s 1, Click's usage 2) untouched. **Section G
+   pins that boundary, and it does so WITHOUT ``CliRunner``** — the
+   runner catches the exception itself, which is precisely why Sections
+   A-F could all pass while the real process disclosed everything.
 
 What "exception fidelity" claims, and with which assertion
 ---------------------------------------------------------
@@ -71,6 +85,32 @@ The mutations this module detects
   (diagnostics destroyed rather than gated), or promoting that detail
   record to INFO or above (which restores the disclosure, because both
   configured handlers render INFO).
+* Reverting the ``if __name__ == "__main__"`` block to call ``cli()``
+  instead of ``run.py::main`` — the propagated exception would again be
+  rendered by CPython with its message, traceback and absolute source
+  paths on ``stderr``, on the one path every operator actually uses.
+* Dropping ``main``'s ``from None``, which would let the interpreter
+  print the original failure as the ``SystemExit``'s ``__context__``;
+  re-raising the original exception from ``main`` instead of
+  ``SystemExit``; or downgrading the exit status to ``0`` so a failed run
+  reports success.
+* Deleting ``main``'s last-resort ``run.aborted`` record, which would
+  turn a failure raised *before* a subcommand's ``try`` — an
+  :exc:`OSError` from ``_build_collaborators``, say — into a completely
+  silent non-zero exit with no diagnostic anywhere.
+* Deleting that record's ``run.aborted.detail`` companion or its
+  ``exc_info``, which would destroy the boundary's traceback instead of
+  gating it on DEBUG — and for a pre-``try`` failure would destroy the
+  only copy of it — or promoting that companion to INFO or above, which
+  would re-create on both sinks exactly the disclosure the silent
+  ``SystemExit`` removed from ``stderr``.
+* Replacing ``main``'s ``try``/``finally`` with plain sequential
+  statements, so a failure *inside* the last-resort logging call escapes
+  and is rendered by CPython — with its own filesystem path — instead of
+  the process exiting quietly with the intended status.
+* Widening ``main``'s ``except`` to :exc:`BaseException`, or catching
+  :exc:`SystemExit`, which would swallow ``ready``'s deliberate exit
+  status and Click's usage exit ``2``.
 
 ``_build_collaborators`` is exercised *implicitly*: it is the first
 statement of every data subcommand, so each invocation here constructs
@@ -112,21 +152,36 @@ recorded on ``result.exception`` where it can be asserted. Passing
 happy-path tests in this module do pass ``catch_exceptions=False``,
 precisely because no exception is expected there.
 
+**Section G deliberately uses no ``CliRunner`` at all.** That is the
+whole point of it: the runner catches the propagated exception itself, so
+it can never observe what CPython's top-level handler would have printed.
+Section G therefore calls ``run.py::main`` directly, executes ``run.py``
+under ``run_name="__main__"``, and runs one real child process — the
+three places the process contract actually lives.
+
 Isolation
 ---------
-Every test consumes ``tmp_output_dir`` and ``tmp_log_dir`` so no
-operator directory is touched, and relies on the three autouse fixtures
-in ``tests/conftest.py`` that reset the correlation ID, the metrics
-registry, and the logger handlers before AND after every test. That
-registry reset is what makes the exact ``== 0.0`` assertions meaningful
-rather than vacuous: a label set that was never incremented reads
-``0.0`` by the Prometheus convention documented on
+Every in-process test consumes ``tmp_output_dir`` and ``tmp_log_dir`` so
+no operator directory is touched, and relies on the three autouse
+fixtures in ``tests/conftest.py`` that reset the correlation ID, the
+metrics registry, and the logger handlers before AND after every test.
+That registry reset is what makes the exact ``== 0.0`` assertions
+meaningful rather than vacuous: a label set that was never incremented
+reads ``0.0`` by the Prometheus convention documented on
 ``MetricsRegistry.get_counter_value``.
+
+Section G's child-process test is the one exception, and deliberately so:
+a subprocess cannot inherit a ``monkeypatch``-ed :mod:`config`, so it is
+redirected with the four ``NBA_*`` path environment variables — every one
+of them pointing inside ``tmp_path`` — while the parent itself writes no
+artifact and emits no record, and therefore needs neither fixture.
 
 Import scope
 ------------
 This module imports only stdlib primitives (``__future__``, ``json``,
-``logging`` — for the ``DEBUG`` level constant handed to ``caplog``, and
+``logging`` — for the ``DEBUG`` level constant handed to ``caplog``,
+``os``, ``pathlib``, ``runpy`` and ``subprocess`` — used by Section G's
+process-boundary tests, ``sys`` for the child interpreter path, and
 ``typing``), ``pytest``, :mod:`config`, :mod:`run` (the ``cli`` group
 plus the module object used as the readiness patch target), the five
 :mod:`pipelines.ingest_<domain>` modules that ``run.py`` itself imports,
@@ -137,6 +192,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import runpy
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 import pytest
@@ -368,6 +428,167 @@ CLI_LOGGER_NAME_TEMPLATE: str = "cli.{subcommand}"
 #: do — they share a single helper — so one is chosen and named rather
 #: than parametrizing a contract that has no per-domain variation.
 DEBUG_GATE_SUBCOMMAND: str = "teams"
+
+
+# ---------------------------------------------------------------------------
+# Process-boundary constants (Section G).
+#
+# Same derivation discipline as Section F: every value is read off
+# ``run.py``'s own contract, off CPython's documented behaviour for
+# ``SystemExit``, or off a token this module injects. None is captured
+# from a run (C1).
+# ---------------------------------------------------------------------------
+
+#: Exit status Click reports for a usage error such as an unknown
+#: subcommand. Click raises ``UsageError``, whose ``exit_code`` is ``2``,
+#: and handles it INSIDE ``Group.main`` while still in standalone mode —
+#: so it becomes a ``SystemExit(2)`` that ``run.py::main``'s
+#: ``except Exception`` must not intercept.
+EXIT_USAGE_ERROR: int = 2
+
+#: A subcommand name ``run.py`` does not register. Spelled to be obviously
+#: absent rather than plausibly future-registered, so this test cannot
+#: start passing vacuously if a new subcommand is added.
+UNKNOWN_SUBCOMMAND: str = "definitely-not-a-registered-subcommand"
+
+#: The operator-facing sentence Click's ``UsageError`` prints for an
+#: unregistered subcommand (``click.Group.resolve_command``). It is
+#: generated from this project's own command registry — never from
+#: payload or upstream data — so it must SURVIVE the process boundary;
+#: suppressing it would cost usability and buy no confidentiality.
+CLICK_UNKNOWN_COMMAND_MESSAGE: str = f"No such command '{UNKNOWN_SUBCOMMAND}'."
+
+#: Sentinel planted in the message of a deliberately failing last-resort
+#: logging call. Distinct from :data:`DISCLOSURE_SENTINEL` so a leak can
+#: be attributed to the right exception, and shaped like a private
+#: filesystem path because that is what a real log-sink failure carries
+#: (:exc:`OSError` puts the path in ``strerror``/``filename``).
+LAST_RESORT_SENTINEL: str = "SECRET_MARKER_log_sink_D4E5F6"
+
+LAST_RESORT_FAILURE_MESSAGE: str = (
+    f"log sink unavailable: /srv/app/private/{LAST_RESORT_SENTINEL}"
+)
+
+#: Event name of the last-resort record ``run.py::_log_aborted_process``
+#: writes at ERROR, read off that helper's format string. Asserting it
+#: PRESENT is what stops the silent ``SystemExit`` degenerating into a
+#: silent failure; asserting it ABSENT on the success, ``ready`` and
+#: usage-error paths is what proves only genuine aborts are converted.
+PROCESS_ABORT_EVENT: str = "run.aborted"
+
+#: Event name of that helper's DEBUG-gated companion record. It shares the
+#: ERROR record's prefix, so every ``PROCESS_ABORT_EVENT`` presence check
+#: is written against the fuller ``run.aborted exit_status=`` form to keep
+#: the two records distinguishable by a text filter.
+PROCESS_ABORT_DETAIL_EVENT: str = "run.aborted.detail"
+
+#: Logger name the process boundary writes under — the PARENT of the
+#: ``"cli.<subcommand>"`` names, so raising it to DEBUG also raises the
+#: subcommand loggers that inherit from it. Spelled literally for the same
+#: reason :data:`CLI_LOGGER_NAME_TEMPLATE` is: a rename in ``run.py`` must
+#: fail here rather than be followed silently.
+PROCESS_LOGGER_NAME: str = "cli"
+
+#: Field prefix carrying the translated exit status on the last-resort
+#: record. Combined with :data:`EXIT_FAILURE` it yields the exact token
+#: ``exit_status=1`` that the record must contain.
+EXIT_STATUS_FIELD_PREFIX: str = "exit_status="
+
+#: Repository root, derived from the CLI module's own ``__file__`` rather
+#: than from a relative literal, so the child-process probe locates the
+#: package under test no matter what directory pytest was started from.
+REPO_ROOT: Path = Path(CLI_SOURCE_PATH).resolve().parent
+
+#: Filename of the driver script the child-process probe writes into
+#: ``tmp_path``. It lives outside ``tests/`` on purpose — pytest's
+#: ``testpaths = tests`` means it is never collected — and it is deleted
+#: with the temporary directory.
+SUBPROCESS_DRIVER_NAME: str = "standalone_cli_probe.py"
+
+#: Hard ceiling for the child process. The child performs no network I/O
+#: (its pipeline is replaced before dispatch) and no sleeps, so a run that
+#: takes longer than this is hung, not slow, and must fail rather than
+#: stall the suite.
+SUBPROCESS_TIMEOUT_SECONDS: float = 120.0
+
+#: ``config.py`` L238-241 reads these four ``NBA_*`` overrides ONCE at
+#: import time (``config._env_path``), which is exactly why the child is
+#: redirected through the environment rather than through
+#: ``monkeypatch.setattr`` — a child process cannot inherit the parent's
+#: monkeypatched module attributes.
+CHILD_OUTPUT_DIR_ENV: str = "NBA_OUTPUT_DIR"
+CHILD_CHECKPOINT_PATH_ENV: str = "NBA_CHECKPOINT_PATH"
+CHILD_LOG_DIR_ENV: str = "NBA_LOG_DIR"
+CHILD_LOG_FILE_ENV: str = "NBA_LOG_FILE"
+
+#: ``config.py`` L252 reads this override for :data:`config.LOG_LEVEL`.
+#: The probe REMOVES it from the child's environment so the child runs at
+#: the default ``"INFO"`` and the DEBUG detail record is level-filtered —
+#: the state an operator gets unless they deliberately opt in.
+CHILD_LOG_LEVEL_ENV: str = "NBA_LOG_LEVEL"
+
+#: Variables the driver script itself reads. Passing the repository root,
+#: the failure message and the pipeline attribute through the environment
+#: keeps :data:`SUBPROCESS_DRIVER_SOURCE` a fixed constant with no string
+#: interpolation, so what the child executes is auditable by reading it.
+CHILD_REPO_ROOT_ENV: str = "PROBE_REPO_ROOT"
+CHILD_FAILURE_MESSAGE_ENV: str = "PROBE_FAILURE_MESSAGE"
+CHILD_PIPELINE_ATTR_ENV: str = "PROBE_PIPELINE_ATTR"
+
+#: ``pipeline`` label of :data:`DEBUG_GATE_SUBCOMMAND`, spelled literally
+#: for the same reason :data:`DATA_SUBCOMMAND_LABELS` is: a label rename
+#: in ``run.py`` must fail here rather than be followed silently by a
+#: derived ``f"ingest_{name}"`` expression.
+DEBUG_GATE_PIPELINE_LABEL: str = "ingest_teams"
+
+#: Subcommand the child probe drives, and the attribute of :mod:`run`
+#: holding the pipeline module it dispatches to. The two differ, exactly
+#: as in :data:`DATA_SUBCOMMAND_LABELS`, so both are spelled literally.
+CHILD_PROBE_SUBCOMMAND: str = "teams"
+CHILD_PROBE_PIPELINE_ATTR: str = "ingest_teams"
+
+#: Class name the driver gives its injected exception. The child's
+#: redacted records must name it in ``error_type=``, which proves the
+#: child really failed the way the probe intended instead of dying of
+#: something incidental such as an import error.
+CHILD_FAILURE_CLASS_NAME: str = "_ChildPipelineFailure"
+
+#: The driver script. It is a FIXED string — no ``format``, no f-string —
+#: so a reader can see exactly what the child runs. It reproduces
+#: ``python run.py <subcommand>`` faithfully in the one respect that
+#: matters here: control reaches ``run.py``'s real process entry point,
+#: ``run.main``, with a pipeline that raises. Injecting the failure is
+#: unavoidable — every genuine pipeline failure needs the network, and
+#: this tier is offline — so the driver replaces exactly one attribute and
+#: changes nothing else.
+SUBPROCESS_DRIVER_SOURCE: str = '''"""Drive run.py's process entry point with one failing pipeline.
+
+Written to a temporary directory by the child-process probe in
+tests/unit/test_cli_failure_paths.py and executed as a real child
+process, so the interpreter's top-level exception handling is the
+genuine article rather than a harness's imitation.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.environ["PROBE_REPO_ROOT"])
+
+import run
+
+FAILURE_MESSAGE = os.environ["PROBE_FAILURE_MESSAGE"]
+
+
+class _ChildPipelineFailure(RuntimeError):
+    """Distinct class so the child's redacted record names it exactly."""
+
+
+def _raise_failure(client, writer, checkpoint, season, logger=None, metrics=None):
+    raise _ChildPipelineFailure(FAILURE_MESSAGE)
+
+
+setattr(getattr(run, os.environ["PROBE_PIPELINE_ATTR"]), "run", _raise_failure)
+run.main(sys.argv[1:])
+'''
 
 
 # ---------------------------------------------------------------------------
@@ -1111,13 +1332,17 @@ def test_ready_subcommand_exits_zero_and_echoes_the_body_when_ready(
 #   every bare ``raise`` is byte-identical, so Sections A-E keep passing
 #   unmodified — which is the point, and which the assertions below
 #   re-prove in the same breath as the confidentiality property.
-# * Deliberately NOT changed: the bare ``raise`` and the
-#   ``if __name__ == "__main__"`` block. AAP §0.5.2.1 mandates
+# * Deliberately NOT changed: the bare ``raise``. AAP §0.5.2.1 mandates
 #   log-and-re-raise, so the original exception must still reach the
 #   caller; redaction governs what this process writes to its OWN log
-#   sinks, not what it propagates. CPython's top-level handler printing a
-#   deliberately propagated exception is not a ``run.py`` logging defect,
-#   and suppressing it would require swallowing the exception.
+#   sinks, not what it propagates — which is why every assertion below
+#   re-proves propagation in the same breath as confidentiality.
+# * The ``if __name__ == "__main__"`` block, by contrast, IS changed, and
+#   Section G owns that half. Leaving it on ``cli()`` meant the exception
+#   this section keeps out of the log sinks was still rendered in full by
+#   CPython onto ``stderr`` — the same disclosure on a channel this
+#   section cannot observe, because ``CliRunner`` catches the exception
+#   before the interpreter ever sees it. See Section G (defect CD-4).
 # * Scope: exercised under Constraint C2, which permits a non-test source
 #   change "to fix a genuine bug found" provided it is minimal and called
 #   out explicitly with the failing case that motivated it (AAP §0.1.4).
@@ -1394,9 +1619,21 @@ def test_failure_detail_is_emitted_only_on_the_debug_gated_channel(
         f"{DETAIL_RECORD_LEVEL} so the default INFO handlers discard it; got "
         f"{detail_record.levelname}"
     )
-    assert detail_record.exc_info is not None, (
-        f"the {FAILURE_DETAIL_EVENT!r} record must carry exc_info; without it "
-        f"the withheld traceback is destroyed rather than gated"
+    # ``or (None, None, None)`` keeps the comparison below well defined
+    # under the mutation it exists to catch: when ``exc_info=True`` is
+    # dropped, ``record.exc_info`` is ``None``, the pair becomes
+    # ``(None, None)``, and the assertion reports a readable diagnosis
+    # instead of raising ``TypeError`` on a subscript. Comparing the
+    # ``(class, value)`` pair — rather than asking merely whether
+    # ``exc_info`` exists — additionally pins the exception CLASS the
+    # record must carry, which a bare existence check cannot do.
+    detail_exc_info = detail_record.exc_info or (None, None, None)
+    assert detail_exc_info[:2] == (_SensitivePipelineFailure, sensitive_failure), (
+        f"the {FAILURE_DETAIL_EVENT!r} record must carry exc_info whose class "
+        f"is {_SensitivePipelineFailure.__name__} and whose value is the "
+        f"raised object, or the withheld traceback is destroyed rather than "
+        f"gated; got {detail_exc_info[:2]!r}, expected "
+        f"{(_SensitivePipelineFailure, sensitive_failure)!r}"
     )
     assert detail_record.exc_info[1] is sensitive_failure, (
         f"the {FAILURE_DETAIL_EVENT!r} record must carry the ORIGINAL "
@@ -1460,4 +1697,1004 @@ def test_failure_detail_is_emitted_only_on_the_debug_gated_channel(
         f"object regardless of log level; got id={id(result.exception)} "
         f"({type(result.exception).__name__}), expected "
         f"id={id(sensitive_failure)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section G — the PROCESS boundary (CWE-209, CWE-532).
+#
+# Section F proved the redaction of run.py's own log sinks. It could not
+# prove anything about the process's error stream, because every one of
+# its invocations goes through ``CliRunner``, which catches the propagated
+# exception before the interpreter can render it. That blind spot is not
+# hypothetical: with Section F fully green, ``python run.py teams`` still
+# exited 1 while printing, on stderr,
+#
+#     Traceback (most recent call last)
+#     ...
+#       File "<abs>/run.py", line 420, in teams
+#       File "<abs>/<driver>.py", line 12, in _boom
+#     _Boom: upstream request failed: https://stats.nba.com/x?<token>
+#
+# — the token, the traceback header, eight absolute source paths and their
+# line numbers. Everything ``_log_failed_run`` withheld from the log sinks
+# was republished on the one channel it does not govern.
+#
+# CD-4 — THE DEFECT THESE TESTS MOTIVATED, with its failing case:
+#
+# * Behaviour before the fix: ``if __name__ == "__main__": cli()``. The
+#   bare ``raise`` closing each handler is mandatory (AAP §0.5.2.1
+#   log-and-re-raise) and Click does not catch non-Click exceptions, so
+#   the exception reached CPython's top-level handler and was rendered in
+#   full. The failing case is the stderr transcript above, reproduced with
+#   a pipeline raising ``SENSITIVE_FAILURE_MESSAGE``.
+# * Behaviour after the fix: the entry point is ``run.py::main``, which
+#   catches ``Exception`` — never ``BaseException`` — writes a redacted
+#   ``run.aborted`` last-resort record, and raises ``SystemExit(1) from
+#   None``. CPython prints nothing for a ``SystemExit`` carrying an int,
+#   and ``from None`` suppresses the context, so stderr is EMPTY while the
+#   exit status and both redacted records survive.
+# * The change: ``main``, ``_log_aborted_process``, and one statement in
+#   the ``__main__`` block. Every callback — bare ``raise``,
+#   ``metrics.registry.inc``, logging — is byte-identical, which is why
+#   Sections A-F keep passing unmodified.
+# * Scope: Constraint C2 permits a non-test source change "to fix a
+#   genuine bug found" when it is minimal and called out explicitly with
+#   the failing case that motivated it (AAP §0.1.4). This is that
+#   call-out; the reproduced transcript above is that failing case.
+#
+# Why these tests use NO CliRunner, and what each mechanism buys:
+#
+# * ``run_module.main([...])`` — the exact callable the ``__main__`` block
+#   invokes, so the translation itself (status, ``from None``, records) is
+#   asserted in-process against the real metrics registry and log sinks.
+# * ``runpy.run_path(..., run_name="__main__")`` — executes run.py's
+#   entry-point block, so a revert to ``cli()`` is caught even though
+#   ``main`` itself would still be correct.
+# * one real child process — the interpreter's genuine top-level handling,
+#   which no in-process harness can imitate. It is the only test here
+#   that spends ~0.5 s, and it is the only one that can observe what an
+#   operator's terminal, CI log or cron mail would actually receive.
+#
+# Every expectation is structural (C1): an exit status, an exception
+# class, a float counter value, an ordered dispatch census, a token this
+# module injects, a field name read off ``run.py``'s own format strings,
+# or CPython's documented ``SystemExit`` behaviour. Nothing is captured
+# from a run.
+# ---------------------------------------------------------------------------
+
+
+class _LastResortLoggingFailure(RuntimeError):
+    """Exception raised by a deliberately broken last-resort logging call.
+
+    Used by exactly one test, to prove that ``run.py::main``'s
+    ``try``/``finally`` keeps its promise when the log sink itself is the
+    thing that is broken — a full disk, a revoked directory, a closed
+    handler. Its message carries its own sentinel so a leak can be
+    attributed to this exception rather than to the injected pipeline
+    failure.
+    """
+
+
+def _assert_redacted_failure_record(channel: str, text: str, subcommand: str) -> None:
+    """Assert the subcommand's redacted ``run.failed`` record is present and useful.
+
+    Presence is asserted with the same rigour as absence: a "fix" that
+    deleted the logging call would satisfy every confidentiality
+    assertion in this section while leaving the operator with no record
+    at all. Each of the three fields is checked separately so a failure
+    names which one went missing.
+    """
+    expected_error_type = (
+        f"{ERROR_TYPE_FIELD_PREFIX}{_SensitivePipelineFailure.__name__}"
+    )
+    assert f"{FAILURE_EVENT} subcommand={subcommand}" in text, (
+        f"the subcommand's redacted {FAILURE_EVENT!r} record must survive the "
+        f"process boundary on {channel}; redaction must not become silent "
+        f"suppression. {channel}={text!r}"
+    )
+    assert expected_error_type in text, (
+        f"the redacted record on {channel} must name the exception CLASS "
+        f"{expected_error_type!r}, which is the static identifier that keeps "
+        f"it triage-able. {channel}={text!r}"
+    )
+    assert REDACTION_MARKER in text, (
+        f"the redacted record on {channel} must carry {REDACTION_MARKER!r} so "
+        f"an operator knows detail exists and is withheld rather than absent. "
+        f"{channel}={text!r}"
+    )
+
+
+def _assert_redacted_abort_record(
+    channel: str,
+    text: str,
+    error_class_name: str,
+) -> None:
+    """Assert the process boundary's redacted ``run.aborted`` record is present.
+
+    This is the record that makes ``main``'s silent ``SystemExit`` a
+    *silent output*, not a *silent failure*: it states that the process
+    gave up, with which status, and of what exception class. For a
+    failure raised before a subcommand's ``try`` — an :exc:`OSError` from
+    ``_build_collaborators``, for instance — it is the ONLY record
+    written, so its three fields are asserted individually.
+    """
+    expected_event = (
+        f"{PROCESS_ABORT_EVENT} {EXIT_STATUS_FIELD_PREFIX}{EXIT_FAILURE}"
+    )
+    assert expected_event in text, (
+        f"the process boundary must record {expected_event!r} on {channel} so "
+        f"the silent exit is still diagnosable. {channel}={text!r}"
+    )
+    assert f"{ERROR_TYPE_FIELD_PREFIX}{error_class_name}" in text, (
+        f"the {PROCESS_ABORT_EVENT!r} record on {channel} must name the "
+        f"exception class {error_class_name!r}. {channel}={text!r}"
+    )
+    assert REDACTION_MARKER in text, (
+        f"the {PROCESS_ABORT_EVENT!r} record on {channel} must carry "
+        f"{REDACTION_MARKER!r}. {channel}={text!r}"
+    )
+
+
+def _assert_no_abort_record(channel: str, text: str, invocation: str) -> None:
+    """Assert no ``run.aborted`` record was written for ``invocation``.
+
+    The counterpart to :func:`_assert_redacted_abort_record`. A boundary
+    that logged an abort for a successful run, for ``ready``'s deliberate
+    ``sys.exit(1)``, or for a Click usage error would be over-broad — it
+    would be catching :exc:`SystemExit` — and would flood operators with
+    false failures.
+    """
+    assert PROCESS_ABORT_EVENT not in text, (
+        f"`{invocation}` must NOT write a {PROCESS_ABORT_EVENT!r} record on "
+        f"{channel}: only a genuine escaped exception is an abort, and "
+        f"SystemExit must pass through untouched. {channel}={text!r}"
+    )
+
+
+def _write_standalone_driver(tmp_path: Path) -> Path:
+    """Write the child-process driver into ``tmp_path`` and return its path.
+
+    The driver lives outside ``tests/`` so ``testpaths = tests`` can never
+    collect it, and inside ``tmp_path`` so pytest deletes it. Its source is
+    the fixed :data:`SUBPROCESS_DRIVER_SOURCE` constant — no interpolation
+    — so what the child executes is auditable by reading this module.
+    """
+    driver = tmp_path / SUBPROCESS_DRIVER_NAME
+    driver.write_text(SUBPROCESS_DRIVER_SOURCE, encoding="utf-8")
+    return driver
+
+
+def _child_environment(tmp_path: Path) -> Dict[str, str]:
+    """Build the child's environment: every artifact path under ``tmp_path``.
+
+    A child process cannot inherit the parent's ``monkeypatch.setattr`` on
+    :mod:`config`, and ``config.py`` reads its ``NBA_*`` overrides once at
+    import time, so the environment is the only way to redirect the child.
+    All four artifact paths point inside ``tmp_path``, and
+    ``NBA_LOG_LEVEL`` is REMOVED so the child runs at the default
+    ``"INFO"`` — the state in which the DEBUG detail record must stay
+    unrendered.
+    """
+    child_output = tmp_path / "child_output"
+    child_logs = tmp_path / "child_logs"
+
+    environment = dict(os.environ)
+    environment.pop(CHILD_LOG_LEVEL_ENV, None)
+    environment[CHILD_OUTPUT_DIR_ENV] = str(child_output)
+    environment[CHILD_CHECKPOINT_PATH_ENV] = str(child_output / "checkpoint.json")
+    environment[CHILD_LOG_DIR_ENV] = str(child_logs)
+    environment[CHILD_LOG_FILE_ENV] = str(child_logs / "pipeline.log")
+    environment[CHILD_REPO_ROOT_ENV] = str(REPO_ROOT)
+    environment[CHILD_FAILURE_MESSAGE_ENV] = SENSITIVE_FAILURE_MESSAGE
+    environment[CHILD_PIPELINE_ATTR_ENV] = CHILD_PROBE_PIPELINE_ATTR
+    return environment
+
+
+@pytest.mark.parametrize("subcommand,pipeline_label", DATA_SUBCOMMAND_LABELS)
+def test_process_entry_point_exits_one_and_renders_nothing_for_a_failed_subcommand(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+    subcommand: str,
+    pipeline_label: str,
+) -> None:
+    """`run.py::main` turns a failed subcommand into a silent, redacted exit 1.
+
+    Invoked WITHOUT ``CliRunner``, so nothing stands between the
+    propagated exception and the boundary under test. Three properties
+    are asserted together because only their conjunction is the contract:
+
+    * the status is exactly ``EXIT_FAILURE`` — a failure is never
+      reported as success, and never as some other status;
+    * the raised object is a ``SystemExit`` whose ``__cause__`` is
+      ``None`` and whose ``__suppress_context__`` is ``True``, which is
+      what ``raise ... from None`` means and what stops CPython printing
+      the original exception as this one's context;
+    * the original failure is nevertheless retained as
+      ``__context__`` — the boundary redacts and translates, it does not
+      erase causality.
+
+    Then every channel is checked: ``stderr`` must be EXACTLY empty, and
+    the complete :data:`FORBIDDEN_DISCLOSURES` tuple must be absent from
+    stdout, stderr and the durable log. Both redacted records must be
+    present and useful, the error counter must still read exactly
+    ``1.0``, and the dispatch census must show only this subcommand ran.
+
+    Mutation detected: reverting the ``__main__`` block or ``main`` to let
+    the exception escape (stderr stops being empty and the sentinel,
+    traceback header and absolute paths all reappear); dropping ``from
+    None`` (``__suppress_context__`` flips and CPython prints the
+    original); re-raising the original instead of ``SystemExit``;
+    exiting ``0``; or deleting either redacted record.
+    """
+    # Arrange — a failure whose message is the confidential payload.
+    sensitive_failure = _SensitivePipelineFailure(SENSITIVE_FAILURE_MESSAGE)
+    recorder: List[str] = []
+    _install_recorders(monkeypatch, recorder)
+    monkeypatch.setattr(
+        PIPELINE_MODULES[subcommand],
+        "run",
+        _make_failing_recorder(recorder, subcommand, sensitive_failure),
+    )
+
+    # Act — the real process entry point, no runner in the way.
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main([subcommand, "--season", config.DEFAULT_SEASON])
+    captured = capsys.readouterr()
+    operator_log = _read_operator_log()
+
+    # Assert — the exact exit status, and the exact exception structure
+    # that keeps the interpreter silent.
+    assert exit_info.value.code == EXIT_FAILURE, (
+        f"`run.py {subcommand}` must exit {EXIT_FAILURE} when its pipeline "
+        f"raises; got {exit_info.value.code!r}"
+    )
+    assert exit_info.value.__cause__ is None, (
+        f"the SystemExit must be raised `from None`, so its __cause__ stays "
+        f"None and the interpreter has no chained exception to render; got "
+        f"{exit_info.value.__cause__!r}"
+    )
+    assert exit_info.value.__suppress_context__ is True, (
+        f"`from None` must set __suppress_context__, which is what stops "
+        f"CPython printing the original exception as this SystemExit's "
+        f"context; got {exit_info.value.__suppress_context__!r}"
+    )
+    assert exit_info.value.__context__ is sensitive_failure, (
+        f"the ORIGINAL failure must remain the SystemExit's __context__ — the "
+        f"boundary redacts causality, it does not erase it; got "
+        f"id={id(exit_info.value.__context__)} "
+        f"({type(exit_info.value.__context__).__name__}), expected "
+        f"id={id(sensitive_failure)}"
+    )
+
+    # Assert — stderr is empty, and nothing confidential reached any of
+    # the three channels this process can write.
+    assert captured.err == "", (
+        f"`run.py {subcommand}` must render NOTHING on stderr after a failed "
+        f"run: CPython prints nothing for a SystemExit carrying an int, which "
+        f"is the whole point of the translation; got {captured.err!r}"
+    )
+    _assert_no_sensitive_disclosure("stdout", captured.out, subcommand)
+    _assert_no_sensitive_disclosure("stderr", captured.err, subcommand)
+    _assert_no_sensitive_disclosure("the operator log file", operator_log, subcommand)
+
+    # Assert — both redacted records survive on both normal channels.
+    for channel, text in (
+        ("stdout", captured.out),
+        ("the operator log file", operator_log),
+    ):
+        _assert_redacted_failure_record(channel, text, subcommand)
+        _assert_redacted_abort_record(
+            channel, text, _SensitivePipelineFailure.__name__
+        )
+
+    # Assert — translation cost none of the Section A-C contracts.
+    assert recorder == [subcommand], (
+        f"`run.py {subcommand}` must dispatch exactly its own pipeline and no "
+        f"sibling; dispatch census={recorder!r} expected {[subcommand]!r}"
+    )
+    observed_error = _runs_counter(pipeline_label, OUTCOME_ERROR)
+    assert observed_error == EXPECTED_COUNTER_HIT, (
+        f'{RUNS_COUNTER}{{pipeline="{pipeline_label}",outcome="{OUTCOME_ERROR}"}} '
+        f"is {observed_error}; expected {EXPECTED_COUNTER_HIT} — the process "
+        f"boundary must not disturb the metric the callback emitted"
+    )
+    observed_success = _runs_counter(pipeline_label, OUTCOME_SUCCESS)
+    assert observed_success == EXPECTED_COUNTER_MISS, (
+        f'{RUNS_COUNTER}{{pipeline="{pipeline_label}",'
+        f'outcome="{OUTCOME_SUCCESS}"}} is {observed_success}; expected '
+        f"{EXPECTED_COUNTER_MISS} — a failed run is never also a success"
+    )
+
+
+def test_process_entry_point_exits_one_and_renders_nothing_for_a_failed_all_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A failed ``all`` run is redacted and silent at the process boundary too.
+
+    ``all_cmd`` has its own ``except`` block and is the command operators
+    actually schedule — the one whose stdout and stderr a cron wrapper or
+    CI job retains — so it gets its own process-boundary coverage rather
+    than being assumed to follow the five data subcommands.
+
+    Fail-fast is re-asserted here because the translation must not change
+    *when* the unwinding happens: the census must still show only the
+    first pipeline of the documented order.
+
+    Mutation detected: wiring the redacting entry point for the five data
+    subcommands but leaving the aggregate on the raw ``cli()`` path; or
+    letting the boundary's abort record be written while the aggregate's
+    own redacted record is lost.
+    """
+    # Arrange — fail the FIRST pipeline of the binding order.
+    sensitive_failure = _SensitivePipelineFailure(SENSITIVE_FAILURE_MESSAGE)
+    recorder: List[str] = []
+    _install_recorders(monkeypatch, recorder)
+    monkeypatch.setattr(
+        PIPELINE_MODULES[FIRST_ALL_PIPELINE],
+        "run",
+        _make_failing_recorder(recorder, FIRST_ALL_PIPELINE, sensitive_failure),
+    )
+
+    # Act
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main(["all", "--season", config.DEFAULT_SEASON])
+    captured = capsys.readouterr()
+    operator_log = _read_operator_log()
+
+    # Assert — status and exception structure.
+    assert exit_info.value.code == EXIT_FAILURE, (
+        f"`run.py all` must exit {EXIT_FAILURE} when a pipeline raises; got "
+        f"{exit_info.value.code!r}"
+    )
+    assert exit_info.value.__suppress_context__ is True, (
+        f"`run.py all` must raise its SystemExit `from None`; got "
+        f"__suppress_context__={exit_info.value.__suppress_context__!r}"
+    )
+    assert exit_info.value.__context__ is sensitive_failure, (
+        f"`run.py all` must retain the ORIGINAL failure as __context__; got "
+        f"id={id(exit_info.value.__context__)} "
+        f"({type(exit_info.value.__context__).__name__}), expected "
+        f"id={id(sensitive_failure)}"
+    )
+
+    # Assert — channels.
+    assert captured.err == "", (
+        f"`run.py all` must render NOTHING on stderr after a failed run; got "
+        f"{captured.err!r}"
+    )
+    _assert_no_sensitive_disclosure("stdout", captured.out, "all")
+    _assert_no_sensitive_disclosure("stderr", captured.err, "all")
+    _assert_no_sensitive_disclosure("the operator log file", operator_log, "all")
+    for channel, text in (
+        ("stdout", captured.out),
+        ("the operator log file", operator_log),
+    ):
+        _assert_redacted_failure_record(channel, text, "all")
+        _assert_redacted_abort_record(
+            channel, text, _SensitivePipelineFailure.__name__
+        )
+
+    # Assert — fail-fast and metrics survive the translation.
+    assert recorder == EXPECTED_ALL_ORDER_AFTER_FIRST_FAILURE, (
+        f"`run.py all` must still stop after the first failing pipeline; "
+        f"dispatch census={recorder!r} expected "
+        f"{EXPECTED_ALL_ORDER_AFTER_FIRST_FAILURE!r}"
+    )
+    observed_error = _runs_counter(ALL_PIPELINE_LABEL, OUTCOME_ERROR)
+    assert observed_error == EXPECTED_COUNTER_HIT, (
+        f'{RUNS_COUNTER}{{pipeline="{ALL_PIPELINE_LABEL}",'
+        f'outcome="{OUTCOME_ERROR}"}} is {observed_error}; expected '
+        f"{EXPECTED_COUNTER_HIT}"
+    )
+
+
+def test_process_entry_point_preserves_a_successful_exit_status_and_logs_no_abort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A successful run still exits 0 through the boundary, with no abort record.
+
+    The boundary must be invisible on the happy path. Click's standalone
+    mode ends a successful invocation in ``ctx.exit()``, which becomes
+    ``SystemExit(0)`` — a :exc:`BaseException` that ``main``'s
+    ``except Exception`` cannot see — so the status passes straight
+    through and the success counter is emitted exactly once.
+
+    The absence of a ``run.aborted`` record is asserted on both channels
+    because a boundary that logged an abort for every invocation would
+    make every successful nightly run look like a failure to log-based
+    alerting.
+
+    Mutation detected: widening ``main``'s ``except`` to
+    :exc:`BaseException` (or adding ``except SystemExit``), which would
+    swallow the success status and convert exit 0 into exit 1; or writing
+    the last-resort record unconditionally instead of only on the failure
+    path.
+    """
+    # Arrange — every pipeline succeeds.
+    recorder: List[str] = []
+    _install_recorders(monkeypatch, recorder)
+
+    # Act
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main([DEBUG_GATE_SUBCOMMAND, "--season", config.DEFAULT_SEASON])
+    captured = capsys.readouterr()
+    operator_log = _read_operator_log()
+
+    # Assert — status and dispatch.
+    assert exit_info.value.code == EXIT_SUCCESS, (
+        f"`run.py {DEBUG_GATE_SUBCOMMAND}` must exit {EXIT_SUCCESS} when its "
+        f"pipeline succeeds; got {exit_info.value.code!r}"
+    )
+    assert recorder == [DEBUG_GATE_SUBCOMMAND], (
+        f"`run.py {DEBUG_GATE_SUBCOMMAND}` must dispatch exactly its own "
+        f"pipeline; dispatch census={recorder!r} expected "
+        f"{[DEBUG_GATE_SUBCOMMAND]!r}"
+    )
+
+    # Assert — no abort record anywhere, and stderr untouched.
+    invocation = f"run.py {DEBUG_GATE_SUBCOMMAND}"
+    _assert_no_abort_record("stdout", captured.out, invocation)
+    _assert_no_abort_record("the operator log file", operator_log, invocation)
+    assert captured.err == "", (
+        f"a successful `{invocation}` must write nothing to stderr; got "
+        f"{captured.err!r}"
+    )
+
+    # Assert — the success metric is emitted exactly once, error stays 0.
+    observed_success = _runs_counter(DEBUG_GATE_PIPELINE_LABEL, OUTCOME_SUCCESS)
+    assert observed_success == EXPECTED_COUNTER_HIT, (
+        f'{RUNS_COUNTER}{{pipeline="{DEBUG_GATE_PIPELINE_LABEL}",'
+        f'outcome="{OUTCOME_SUCCESS}"}} is {observed_success}; expected '
+        f"{EXPECTED_COUNTER_HIT}"
+    )
+    observed_error = _runs_counter(DEBUG_GATE_PIPELINE_LABEL, OUTCOME_ERROR)
+    assert observed_error == EXPECTED_COUNTER_MISS, (
+        f'{RUNS_COUNTER}{{pipeline="{DEBUG_GATE_PIPELINE_LABEL}",'
+        f'outcome="{OUTCOME_ERROR}"}} is {observed_error}; expected '
+        f"{EXPECTED_COUNTER_MISS}"
+    )
+
+
+def test_process_entry_point_preserves_readys_deliberate_nonzero_exit_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``ready``'s deliberate ``sys.exit(1)`` passes through unconverted and unlogged.
+
+    A deliberate non-zero exit and an aborted failure are different
+    events that happen to share a status, and the boundary must keep them
+    distinguishable: ``ready`` still echoes its probe body first, exits
+    ``1`` on its own terms, and produces NO ``run.aborted`` record —
+    because ``sys.exit`` raises :exc:`SystemExit`, which
+    ``except Exception`` does not catch.
+
+    Mutation detected: catching :exc:`BaseException` (or
+    :exc:`SystemExit`) in ``main``, which would relabel every deliberate
+    exit as an abort and, worse, could mask ``ready``'s verdict behind a
+    generic failure record.
+    """
+    # Arrange — a deterministic not-ready verdict.
+    monkeypatch.setattr(
+        run_module.health,
+        "check_readiness",
+        _make_readiness_probe(NOT_READY_PROBE_RESULT),
+    )
+
+    # Act
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main(["ready"])
+    captured = capsys.readouterr()
+
+    # Assert — the status is ready's own, and the body was echoed first.
+    assert exit_info.value.code == EXIT_FAILURE, (
+        f"`run.py ready` must exit {EXIT_FAILURE} when the probe reports "
+        f"{NOT_READY_PROBE_RESULT['status']!r}; got {exit_info.value.code!r}"
+    )
+    assert json.loads(captured.out) == NOT_READY_PROBE_RESULT, (
+        f"`run.py ready` must echo the probe body verbatim BEFORE exiting; "
+        f"parsed stdout={json.loads(captured.out)!r} expected "
+        f"{NOT_READY_PROBE_RESULT!r}"
+    )
+    assert exit_info.value.__context__ is None, (
+        f"a deliberate `sys.exit(1)` is not an aborted failure, so the "
+        f"SystemExit must carry no exception context; got "
+        f"{exit_info.value.__context__!r}"
+    )
+
+    # Assert — nothing was treated as an abort.
+    _assert_no_abort_record("stdout", captured.out, "run.py ready")
+    assert captured.err == "", (
+        f"`run.py ready` must emit its verdict on stdout and nothing on "
+        f"stderr; got {captured.err!r}"
+    )
+
+
+def test_process_entry_point_preserves_clicks_usage_error_exit_status_and_message(
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A Click usage error keeps exit 2 and keeps Click's own message on stderr.
+
+    The boundary must be narrow in both directions. Click resolves an
+    unregistered subcommand into a ``UsageError`` *inside*
+    ``Group.main``, which in standalone mode prints the message and calls
+    ``sys.exit(2)`` — so ``main`` sees a :exc:`SystemExit` and leaves it
+    alone. That matters for usability: this message is generated from
+    this project's own command registry, never from payload or upstream
+    data, so it is exactly the kind of stderr output that must SURVIVE.
+
+    Mutation detected: catching :exc:`BaseException` in ``main`` (usage
+    errors would collapse to exit 1 with no explanation, and ``--help``
+    would break the same way); or "hardening" the boundary by silencing
+    stderr wholesale rather than by not rendering exceptions.
+    """
+    # Act — no arrange step: the subcommand simply does not exist.
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main([UNKNOWN_SUBCOMMAND])
+    captured = capsys.readouterr()
+
+    # Assert — Click's own status and message survive intact.
+    assert exit_info.value.code == EXIT_USAGE_ERROR, (
+        f"an unknown subcommand must keep Click's usage status "
+        f"{EXIT_USAGE_ERROR}; got {exit_info.value.code!r}"
+    )
+    assert CLICK_UNKNOWN_COMMAND_MESSAGE in captured.err, (
+        f"Click's operator-facing usage message "
+        f"{CLICK_UNKNOWN_COMMAND_MESSAGE!r} must still reach stderr — the "
+        f"boundary suppresses rendered EXCEPTIONS, not all diagnostics; "
+        f"stderr={captured.err!r}"
+    )
+    assert TRACEBACK_HEADER not in captured.err, (
+        f"a usage error must never print a traceback; stderr={captured.err!r}"
+    )
+
+    # Assert — a usage error is not an abort.
+    _assert_no_abort_record("stdout", captured.out, f"run.py {UNKNOWN_SUBCOMMAND}")
+    _assert_no_abort_record("stderr", captured.err, f"run.py {UNKNOWN_SUBCOMMAND}")
+
+
+def test_process_entry_point_exit_status_survives_a_failing_last_resort_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A broken last-resort log call still yields a silent, redacted exit 1.
+
+    ``main`` writes its last-resort record inside a ``try``/``finally``
+    precisely because the log sink can be the casualty — a full disk, a
+    revoked directory, a closed handler. If that call raises, the
+    ``finally`` still raises ``SystemExit(1) from None``, so the second
+    exception replaces the first and its context is suppressed: neither
+    the injected pipeline failure NOR the logging failure can reach the
+    traceback renderer, and the status is never downgraded to ``0``.
+
+    The exception chain is asserted exactly — ``__context__`` is the
+    logging failure and ITS ``__context__`` is the original pipeline
+    failure — because that chain is what an in-process caller can still
+    inspect, and losing it would mean the boundary destroyed causality
+    rather than withholding it.
+
+    Mutation detected: replacing the ``try``/``finally`` with a plain
+    sequence of statements, so a logging failure escapes ``main`` and
+    CPython renders IT — path and all — instead of exiting quietly;
+    dropping ``from None`` so the chain is printed; or letting the
+    logging failure change the exit status.
+    """
+    # Arrange — a failing pipeline AND a failing last-resort logger.
+    sensitive_failure = _SensitivePipelineFailure(SENSITIVE_FAILURE_MESSAGE)
+    recorder: List[str] = []
+    _install_recorders(monkeypatch, recorder)
+    monkeypatch.setattr(
+        PIPELINE_MODULES[DEBUG_GATE_SUBCOMMAND],
+        "run",
+        _make_failing_recorder(recorder, DEBUG_GATE_SUBCOMMAND, sensitive_failure),
+    )
+
+    def _raise_logging_failure() -> None:
+        raise _LastResortLoggingFailure(LAST_RESORT_FAILURE_MESSAGE)
+
+    monkeypatch.setattr(run_module, "_log_aborted_process", _raise_logging_failure)
+
+    # Act
+    with pytest.raises(SystemExit) as exit_info:
+        run_module.main([DEBUG_GATE_SUBCOMMAND, "--season", config.DEFAULT_SEASON])
+    captured = capsys.readouterr()
+
+    # Assert — the status and the suppression survive the second failure.
+    assert exit_info.value.code == EXIT_FAILURE, (
+        f"a broken last-resort record must not change the exit status; "
+        f"expected {EXIT_FAILURE}, got {exit_info.value.code!r}"
+    )
+    assert exit_info.value.__suppress_context__ is True, (
+        f"the SystemExit must still be raised `from None` when the last-resort "
+        f"record fails; got "
+        f"__suppress_context__={exit_info.value.__suppress_context__!r}"
+    )
+    assert type(exit_info.value.__context__) is _LastResortLoggingFailure, (
+        f"the exception in flight when the finally-clause runs is the LOGGING "
+        f"failure, so it must be the SystemExit's __context__; got "
+        f"{type(exit_info.value.__context__).__name__}"
+    )
+    assert exit_info.value.__context__.__context__ is sensitive_failure, (
+        f"the ORIGINAL pipeline failure must remain reachable one link "
+        f"further down the chain; got "
+        f"id={id(exit_info.value.__context__.__context__)} "
+        f"({type(exit_info.value.__context__.__context__).__name__}), expected "
+        f"id={id(sensitive_failure)}"
+    )
+
+    # Assert — neither exception's text reached a channel.
+    assert captured.err == "", (
+        f"neither the pipeline failure nor the logging failure may be rendered "
+        f"on stderr; got {captured.err!r}"
+    )
+    _assert_no_sensitive_disclosure("stdout", captured.out, DEBUG_GATE_SUBCOMMAND)
+    _assert_no_sensitive_disclosure("stderr", captured.err, DEBUG_GATE_SUBCOMMAND)
+    for channel, text in (("stdout", captured.out), ("stderr", captured.err)):
+        assert LAST_RESORT_SENTINEL not in text, (
+            f"the LOGGING failure's message must not be disclosed on {channel} "
+            f"either — a log-sink error carries a private filesystem path; "
+            f"{channel}={text!r}"
+        )
+
+    # Assert — the callback's own redacted record was still written, so the
+    # run is diagnosable even though the boundary's record was lost.
+    _assert_redacted_failure_record("stdout", captured.out, DEBUG_GATE_SUBCOMMAND)
+
+
+def test_module_main_block_dispatches_through_the_redacting_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """``run.py``'s ``__main__`` block routes through ``main``, not bare ``cli()``.
+
+    Every other test in this section calls ``run_module.main`` directly,
+    so all of them would still pass if the ``if __name__ ==
+    "__main__"`` block were reverted to ``cli()`` — the wiring, not the
+    wrapper, is what this test pins. ``runpy.run_path(...,
+    run_name="__main__")`` executes that block for real, in-process:
+    ``run.py``'s body runs again in a fresh namespace, the already
+    imported ``pipelines`` modules (and therefore the monkeypatched
+    ``run`` attributes) are reused, and the entry-point statement fires.
+
+    Under the correct wiring this raises ``SystemExit(1)`` with a
+    suppressed context; under the reverted wiring the injected
+    ``_SensitivePipelineFailure`` escapes ``run_path`` instead, and
+    ``pytest.raises(SystemExit)`` fails loudly with the disclosure that
+    the real process would have printed.
+
+    Mutation detected: reverting the entry point to ``cli()``; guarding
+    it with a different dunder check so it never fires; or calling
+    ``main`` without letting its ``SystemExit`` propagate.
+    """
+    # Arrange — the argv a shell would supply, plus a failing pipeline.
+    sensitive_failure = _SensitivePipelineFailure(SENSITIVE_FAILURE_MESSAGE)
+    recorder: List[str] = []
+    _install_recorders(monkeypatch, recorder)
+    monkeypatch.setattr(
+        PIPELINE_MODULES[DEBUG_GATE_SUBCOMMAND],
+        "run",
+        _make_failing_recorder(recorder, DEBUG_GATE_SUBCOMMAND, sensitive_failure),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            Path(CLI_SOURCE_PATH).name,
+            DEBUG_GATE_SUBCOMMAND,
+            "--season",
+            config.DEFAULT_SEASON,
+        ],
+    )
+
+    # Act — execute run.py exactly as `python run.py ...` does.
+    with pytest.raises(SystemExit) as exit_info:
+        runpy.run_path(CLI_SOURCE_PATH, run_name="__main__")
+    captured = capsys.readouterr()
+    operator_log = _read_operator_log()
+
+    # Assert — the block produced the redacting boundary's SystemExit.
+    assert exit_info.value.code == EXIT_FAILURE, (
+        f"executing run.py as __main__ must exit {EXIT_FAILURE} when the "
+        f"pipeline raises; got {exit_info.value.code!r}"
+    )
+    assert exit_info.value.__suppress_context__ is True, (
+        f"the __main__ block must reach the boundary that raises `from None`; "
+        f"got __suppress_context__={exit_info.value.__suppress_context__!r}"
+    )
+    assert exit_info.value.__context__ is sensitive_failure, (
+        f"the SystemExit produced by the __main__ block must carry the "
+        f"ORIGINAL failure as its context; got "
+        f"id={id(exit_info.value.__context__)} "
+        f"({type(exit_info.value.__context__).__name__}), expected "
+        f"id={id(sensitive_failure)}"
+    )
+
+    # Assert — the entry point disclosed nothing and recorded the abort.
+    assert captured.err == "", (
+        f"executing run.py as __main__ must render nothing on stderr; got "
+        f"{captured.err!r}"
+    )
+    _assert_no_sensitive_disclosure("stdout", captured.out, DEBUG_GATE_SUBCOMMAND)
+    _assert_no_sensitive_disclosure("stderr", captured.err, DEBUG_GATE_SUBCOMMAND)
+    _assert_redacted_abort_record(
+        "stdout", captured.out, _SensitivePipelineFailure.__name__
+    )
+    _assert_redacted_abort_record(
+        "the operator log file", operator_log, _SensitivePipelineFailure.__name__
+    )
+    assert recorder == [DEBUG_GATE_SUBCOMMAND], (
+        f"the __main__ block must dispatch exactly the requested subcommand; "
+        f"dispatch census={recorder!r} expected {[DEBUG_GATE_SUBCOMMAND]!r}"
+    )
+
+
+def test_standalone_child_process_renders_no_exception_detail_on_stderr(
+    tmp_path: Path,
+) -> None:
+    """A real child process exits 1 with an EMPTY stderr and redacted stdout.
+
+    This is the only test in the repository that observes the genuine
+    interpreter top level, and it exists because no in-process harness
+    can: ``CliRunner`` catches the exception, and even a direct
+    ``main([...])`` call is judged by assertions rather than by CPython's
+    own rendering. Here a real ``python`` child runs ``run.py``'s entry
+    point with one pipeline replaced by a raiser, and the parent inspects
+    exactly what an operator's terminal, a CI log or cron mail would
+    receive.
+
+    ``stderr`` is asserted to be EXACTLY empty — the strongest available
+    form of "nothing was rendered" — and the complete forbidden-disclosure
+    tuple, extended with the driver's own path, is additionally checked
+    against stderr, stdout and the child's durable log so a failure names
+    precisely what leaked and where. The redacted records must be present
+    on stdout and in the child's log, and both DEBUG detail records must
+    be absent from that log, which proves the gating holds at the default
+    ``config.LOG_LEVEL`` in a real process rather than only under a
+    test-raised logger level.
+
+    Isolation: the child writes only inside ``tmp_path`` (all four
+    ``NBA_*`` path overrides are redirected there), runs with ``-B`` so it
+    leaves no bytecode behind, starts in ``tmp_path`` rather than the
+    repository, performs no network I/O because its pipeline never runs,
+    and is bounded by an explicit timeout. The parent needs neither
+    ``tmp_output_dir`` nor ``tmp_log_dir``: it writes no artifact and
+    emits no log record of its own, and ``monkeypatch.setattr`` could not
+    reach the child anyway — which is exactly why the redirection is done
+    through the environment.
+
+    Mutation detected: reverting the entry point to ``cli()``, or any
+    change that lets an exception reach CPython's top level — the
+    sentinel, ``Traceback (most recent call last)``, ``File "..."``
+    frames and absolute source paths all reappear, and stderr stops being
+    empty.
+    """
+    # Arrange — the driver and a fully redirected child environment.
+    driver = _write_standalone_driver(tmp_path)
+    environment = _child_environment(tmp_path)
+    child_log = Path(environment[CHILD_LOG_FILE_ENV])
+
+    # Act — a real child process, no harness in the way.
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(driver),
+            CHILD_PROBE_SUBCOMMAND,
+            "--season",
+            config.DEFAULT_SEASON,
+        ],
+        cwd=str(tmp_path),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        check=False,
+    )
+    child_log_text = child_log.read_text(encoding="utf-8")
+
+    # Assert — the process contract: non-zero status, silent stderr.
+    assert completed.returncode == EXIT_FAILURE, (
+        f"`python run.py {CHILD_PROBE_SUBCOMMAND}` must exit {EXIT_FAILURE} "
+        f"when its pipeline raises; got {completed.returncode}. "
+        f"stdout={completed.stdout!r} stderr={completed.stderr!r}"
+    )
+    assert completed.stderr == "", (
+        f"the child process must render NOTHING on stderr: the exception is "
+        f"translated into SystemExit({EXIT_FAILURE}) `from None`, and CPython "
+        f"prints nothing for a SystemExit carrying an int. This is the exact "
+        f"disclosure CD-4 fixed. stderr={completed.stderr!r}"
+    )
+
+    # Assert — no forbidden disclosure on any channel the child wrote.
+    child_forbidden = FORBIDDEN_DISCLOSURES + (
+        ("absolute path of the child driver script", str(driver)),
+    )
+    for channel, text in (
+        ("child stderr", completed.stderr),
+        ("child stdout", completed.stdout),
+        ("the child's durable log file", child_log_text),
+    ):
+        for description, forbidden in child_forbidden:
+            assert forbidden not in text, (
+                f"the child process disclosed the {description} on {channel}: "
+                f"{forbidden!r} must never appear there (CWE-209, CWE-532). "
+                f"{channel}={text!r}"
+            )
+
+    # Assert — the redacted records ARE there, on both channels.
+    for channel, text in (
+        ("child stdout", completed.stdout),
+        ("the child's durable log file", child_log_text),
+    ):
+        assert f"{FAILURE_EVENT} subcommand={CHILD_PROBE_SUBCOMMAND}" in text, (
+            f"the child must still record {FAILURE_EVENT!r} for "
+            f"{CHILD_PROBE_SUBCOMMAND!r} on {channel}; {channel}={text!r}"
+        )
+        _assert_redacted_abort_record(channel, text, CHILD_FAILURE_CLASS_NAME)
+
+    # Assert — both DEBUG detail records stayed unrendered at the default
+    # log level, so the gating is real and not a test artefact.
+    for detail_event in (FAILURE_DETAIL_EVENT, PROCESS_ABORT_DETAIL_EVENT):
+        assert detail_event not in child_log_text, (
+            f"{detail_event!r} is emitted at {DETAIL_RECORD_LEVEL} and must be "
+            f"discarded by the default config.LOG_LEVEL handlers, so it must "
+            f"not reach the child's durable log; log={child_log_text!r}"
+        )
+
+
+def test_process_abort_detail_is_emitted_only_on_the_debug_gated_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    capsys: pytest.CaptureFixture,
+    caplog,
+) -> None:
+    """The boundary GATES its traceback on DEBUG rather than destroying it.
+
+    The exact counterpart, for the process boundary's own record, of the
+    Section F test that pins ``run.failed.detail``. Without it, "stderr is
+    empty" would be satisfiable by simply throwing the diagnostics away —
+    and for a failure raised *before* a subcommand's ``try`` (an
+    :exc:`OSError` from ``_build_collaborators``, say) that would leave no
+    recoverable causality anywhere in the system, because
+    ``run.aborted.detail`` is then the only record carrying it.
+
+    The two records are asserted separately because their obligations are
+    opposite: the ERROR record must carry NO ``exc_info`` (attaching it is
+    exactly what ``log.exception`` did wrong), while the DEBUG record must
+    carry the ORIGINAL exception object so an opted-in operator recovers
+    the true chain rather than a reconstruction.
+
+    Only the ``"cli"`` logger is raised to DEBUG, via
+    ``caplog.at_level(..., logger=...)``. ``utils.logger._configure`` sets
+    the level on the ROOT logger and on both handlers — never on a named
+    logger — so the record is emitted and captured in-process while both
+    normal sinks, being level-filtered, render nothing of it. That is
+    asserted too: raising a logger's level must not turn stdout or the
+    durable log into a disclosure channel.
+
+    Mutation detected: deleting the ``run.aborted.detail`` record (the
+    traceback is destroyed, not gated); dropping its ``exc_info=True``
+    (the record survives carrying no causality); promoting it to INFO or
+    above (both handlers would render the traceback, re-creating the very
+    disclosure CD-4 removed); or attaching ``exc_info`` to the ERROR
+    record.
+    """
+    # Arrange — raise ONLY the boundary logger's level, then fail.
+    sensitive_failure = _SensitivePipelineFailure(SENSITIVE_FAILURE_MESSAGE)
+    recorder: List[str] = []
+    _install_recorders(monkeypatch, recorder)
+    monkeypatch.setattr(
+        PIPELINE_MODULES[DEBUG_GATE_SUBCOMMAND],
+        "run",
+        _make_failing_recorder(recorder, DEBUG_GATE_SUBCOMMAND, sensitive_failure),
+    )
+
+    # Act
+    with caplog.at_level(logging.DEBUG, logger=PROCESS_LOGGER_NAME):
+        with pytest.raises(SystemExit) as exit_info:
+            run_module.main(
+                [DEBUG_GATE_SUBCOMMAND, "--season", config.DEFAULT_SEASON]
+            )
+    captured = capsys.readouterr()
+    operator_log = _read_operator_log()
+
+    # Assert — exactly one detail record, at DEBUG, carrying the ORIGINAL
+    # exception object rather than a copy of its text.
+    detail_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith(PROCESS_ABORT_DETAIL_EVENT)
+    ]
+    assert len(detail_records) == 1, (
+        f"the process boundary must emit exactly one "
+        f"{PROCESS_ABORT_DETAIL_EVENT!r} record per aborted run so causality "
+        f"stays recoverable; captured "
+        f"{[record.getMessage() for record in caplog.records]!r}"
+    )
+    detail_record = detail_records[0]
+    assert detail_record.levelname == DETAIL_RECORD_LEVEL, (
+        f"the {PROCESS_ABORT_DETAIL_EVENT!r} record must be emitted at "
+        f"{DETAIL_RECORD_LEVEL} so the default INFO handlers discard it; got "
+        f"{detail_record.levelname}"
+    )
+    # ``or (None, None, None)`` keeps the comparison well defined under the
+    # mutation it exists to catch: with ``exc_info=True`` dropped the pair
+    # becomes ``(None, None)`` and the assertion reports a readable
+    # diagnosis instead of raising ``TypeError`` on a subscript.
+    detail_exc_info = detail_record.exc_info or (None, None, None)
+    assert detail_exc_info[:2] == (_SensitivePipelineFailure, sensitive_failure), (
+        f"the {PROCESS_ABORT_DETAIL_EVENT!r} record must carry exc_info whose "
+        f"class is {_SensitivePipelineFailure.__name__} and whose value is the "
+        f"raised object; got {detail_exc_info[:2]!r}, expected "
+        f"{(_SensitivePipelineFailure, sensitive_failure)!r}"
+    )
+    assert detail_record.exc_info[1] is sensitive_failure, (
+        f"the {PROCESS_ABORT_DETAIL_EVENT!r} record must carry the ORIGINAL "
+        f"exception object; got id={id(detail_record.exc_info[1])} "
+        f"({type(detail_record.exc_info[1]).__name__}), expected "
+        f"id={id(sensitive_failure)}"
+    )
+
+    # Assert — the redacted ERROR record accompanies it and carries no
+    # exc_info of its own.
+    redacted_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith(
+            f"{PROCESS_ABORT_EVENT} {EXIT_STATUS_FIELD_PREFIX}"
+        )
+    ]
+    assert len(redacted_records) == 1, (
+        f"the redacted {PROCESS_ABORT_EVENT!r} record must still be emitted "
+        f"alongside the detail record — the detail SUPPLEMENTS it and never "
+        f"replaces it; captured "
+        f"{[record.getMessage() for record in caplog.records]!r}"
+    )
+    redacted_record = redacted_records[0]
+    assert redacted_record.levelname == REDACTED_RECORD_LEVEL, (
+        f"the redacted {PROCESS_ABORT_EVENT!r} record must be emitted at "
+        f"{REDACTED_RECORD_LEVEL}; got {redacted_record.levelname}"
+    )
+    assert redacted_record.exc_info is None, (
+        f"the {REDACTED_RECORD_LEVEL} {PROCESS_ABORT_EVENT!r} record must "
+        f"carry NO exc_info — attaching it is what published tracebacks to "
+        f"both normal sinks; got {redacted_record.exc_info!r}"
+    )
+    assert REDACTION_MARKER in redacted_record.getMessage(), (
+        f"the redacted {PROCESS_ABORT_EVENT!r} record must carry "
+        f"{REDACTION_MARKER!r}; got {redacted_record.getMessage()!r}"
+    )
+
+    # Assert — the level-filtered handlers rendered none of the gated
+    # detail, and the outcome is unchanged by the raised logger level.
+    _assert_no_sensitive_disclosure("stdout", captured.out, DEBUG_GATE_SUBCOMMAND)
+    _assert_no_sensitive_disclosure("stderr", captured.err, DEBUG_GATE_SUBCOMMAND)
+    _assert_no_sensitive_disclosure(
+        "the operator log file", operator_log, DEBUG_GATE_SUBCOMMAND
+    )
+    assert PROCESS_ABORT_DETAIL_EVENT not in operator_log, (
+        f"the {DETAIL_RECORD_LEVEL} record must not be rendered into the "
+        f"durable log while {REDACTED_RECORD_LEVEL}-level handlers are "
+        f"configured; operator log={operator_log!r}"
+    )
+    assert exit_info.value.code == EXIT_FAILURE, (
+        f"`run.py {DEBUG_GATE_SUBCOMMAND}` must exit {EXIT_FAILURE} regardless "
+        f"of log level; got {exit_info.value.code!r}"
     )
