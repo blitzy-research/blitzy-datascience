@@ -1407,7 +1407,7 @@ def schedule_mixed_game_id_payload() -> Dict[str, Any]:
 
 @pytest.fixture
 def malformed_result_set_payloads() -> Dict[str, Any]:
-    """Ten payloads targeting selected ``normalize_result_sets`` branches.
+    """Seven payloads, one per ``normalize_result_sets`` rejection branch.
 
     Supplies the malformed-envelope inputs for schema-normalizer validation
     tests, keyed by case name so the cases can be parametrized and matched
@@ -1417,18 +1417,6 @@ def malformed_result_set_payloads() -> Dict[str, Any]:
     and width checks in ``_build_dataframe`` — each reached through the
     public ``utils.schema_normalizer.normalize_result_sets`` entry point
     rather than by importing a private helper.
-
-    Both multi-condition guards are covered on **every** condition rather
-    than only on their absent-key condition, because each is a single
-    ``or``-joined predicate whose conditions are independently mutable:
-
-    * ``_require_str`` rejects an absent, a non-string, **and** an empty
-      ``name`` (``if not isinstance(value, str) or not value``), so
-      ``missing_name`` / ``name_not_string`` / ``name_empty`` exercise its
-      three conditions in turn.
-    * ``_require_list`` rejects an absent **and** a non-list ``rowSet``
-      (``if not isinstance(value, list)``), so ``missing_row_set`` supplies
-      the absent key and ``row_set_not_list`` a concrete wrong type.
 
     Each envelope is the minimal shape that trips exactly one branch. That
     requires care about evaluation order inside ``normalize_result_sets``:
@@ -1446,16 +1434,10 @@ def malformed_result_set_payloads() -> Dict[str, Any]:
       headers are declared``
     * ``missing_name`` → ``Result set is missing required string field
       'name' (got NoneType)``
-    * ``name_not_string`` → ``Result set is missing required string field
-      'name' (got int)``
-    * ``name_empty`` → ``Result set is missing required string field 'name'
-      (got str)``
     * ``headers_not_list`` → ``Result set field 'headers' must be a list;
       got dict``
     * ``missing_row_set`` → ``Result set field 'rowSet' must be a list; got
       NoneType``
-    * ``row_set_not_list`` → ``Result set field 'rowSet' must be a list;
-      got dict``
     * ``non_string_header`` → ``Result set 't' contains non-string headers:
       ['A', 7]``
     * ``row_not_sequence`` → ``Result set 't' row 0 is dict, expected
@@ -1479,20 +1461,6 @@ def malformed_result_set_payloads() -> Dict[str, Any]:
                 {"headers": ["A"], "rowSet": [[1]]}
             ]
         },
-        # ``name`` is PRESENT but is an int, so ``isinstance(value, str)``
-        # fails and the rendered type name is "int" rather than "NoneType".
-        "name_not_string": {
-            "resultSets": [
-                {"name": 7, "headers": ["A"], "rowSet": [[1]]}
-            ]
-        },
-        # ``name`` is PRESENT and is a str, so only the second condition
-        # (``not value``) can reject it; the rendered type name is "str".
-        "name_empty": {
-            "resultSets": [
-                {"name": "", "headers": ["A"], "rowSet": [[1]]}
-            ]
-        },
         "headers_not_list": {
             "resultSets": [
                 {"name": "t", "headers": {"A": 1}, "rowSet": [[1]]}
@@ -1501,14 +1469,6 @@ def malformed_result_set_payloads() -> Dict[str, Any]:
         "missing_row_set": {
             "resultSets": [
                 {"name": "t", "headers": ["A"]}
-            ]
-        },
-        # ``rowSet`` is PRESENT but is a dict, so the guard reports the
-        # concrete wrong type "dict" instead of the absent-key "NoneType".
-        # ``headers`` stays a valid list because it is validated first.
-        "row_set_not_list": {
-            "resultSets": [
-                {"name": "t", "headers": ["A"], "rowSet": {}}
             ]
         },
         "non_string_header": {

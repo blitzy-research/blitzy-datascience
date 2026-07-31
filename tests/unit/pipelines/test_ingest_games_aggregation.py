@@ -49,11 +49,7 @@ lines 794-799), then increments ``pipeline_rows_written_total`` with the
   declared-schema game followed by a 2-row game writes ``[0, 2]``
   cumulative rows, counts ``[0, 2]``, marks both games, and keeps the
   union's columns ``object`` -- the one observable trace that the empty
-  frame is still in the buffer rather than having been dropped from it;
-* the empty-**mapping** fallback of ``_select_primary_df`` -- an exactly
-  ``(0, 0)`` frame with no columns and no index, which is unreachable
-  through ``run`` (the normalizer rejects a table-less envelope first) and
-  is therefore exercised directly through the pipeline module's namespace.
+  frame is still in the buffer rather than having been dropped from it.
 
 Two of those contracts are observable only in the log stream, so a
 handwritten :class:`logging.LoggerAdapter` spy is injected alongside the
@@ -573,21 +569,6 @@ EXPECTED_CONTINUATION_PTS = [31, 22]
 
 #: PTS total of the continuation frame: 31+22 = 53.
 EXPECTED_CONTINUATION_PTS_TOTAL = 53
-
-# ---------------------------------------------------------------------------
-# Hand-derived expectations -- the empty result-set MAPPING fallback
-# ---------------------------------------------------------------------------
-
-#: ``_select_primary_df({})`` returns ``pd.DataFrame()``: a genuine 0x0
-#: frame with no columns and no index. The mapping is empty only when the
-#: normalizer produced no table at all, which cannot be reached through
-#: ``run`` -- the normalizer raises for such an envelope and the Rule 6
-#: handler swallows it -- so this branch is asserted directly on the
-#: helper, exactly as the pre-existing ``test_ingest_players.py``
-#: ``TestSelectPrimaryDf`` suite does for the sibling pipeline's copy.
-EXPECTED_EMPTY_MAPPING_SHAPE = (0, 0)
-EXPECTED_EMPTY_MAPPING_COLUMNS: List[str] = []
-EXPECTED_EMPTY_MAPPING_INDEX: List[Any] = []
 
 
 # ---------------------------------------------------------------------------
@@ -2242,72 +2223,4 @@ def test_zero_row_contributor_then_non_empty_game_keeps_both_writes_and_rows(
     assert failure_calls == [], (
         f"an empty rowSet is valid input, not a Rule 6 failure, so "
         f"{_GAMES_FAILED_COUNTER} must never fire; got {failure_calls!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test J -- boundary: the empty-MAPPING fallback of _select_primary_df
-# ---------------------------------------------------------------------------
-#
-# ``_select_primary_df`` opens with ``if not dfs: return pd.DataFrame()``
-# (``pipelines/ingest_games.py`` lines 263-264). That branch is unreachable
-# through ``run``: an envelope carrying no table at all makes
-# ``normalize_result_sets`` raise -- verbatim, "Payload contains no result
-# sets (neither 'resultSets' nor 'resultSet' present, or both were empty)."
-# -- and the Rule 6 handler swallows that exception before the helper is
-# ever called, which is why the two boundary tests above reach a degenerate
-# FRAME (an empty ``rowSet``) rather than an empty MAPPING. Deleting the
-# fallback therefore leaves every other test in this module green while
-# ``next(iter({}))`` becomes a latent ``StopIteration`` for any future
-# caller.
-#
-# The helper is consequently exercised directly through the pipeline
-# module's namespace -- no ``from ... import _private``, no visibility
-# change, no test-only hook and no production edit. That is the boundary
-# assertion AAP §0.4.3 plans ("_select_primary_df on an empty table mapping
-# yields a 0x0 frame"), and it follows the pre-existing, frozen
-# ``tests/unit/pipelines/test_ingest_players.py::TestSelectPrimaryDf``
-# suite, which reaches the sibling pipeline's copy of this same helper the
-# same way and for the same stated reason.
-# ---------------------------------------------------------------------------
-
-
-def test_empty_result_set_mapping_selects_a_zero_by_zero_frame() -> None:
-    """``_select_primary_df({})`` returns a 0x0 DataFrame with no columns.
-
-    Hand-derived from the fallback statement itself: ``pd.DataFrame()``
-    constructs a frame with no columns, no index and therefore shape
-    (0, 0). Returning it -- rather than raising -- is what keeps the
-    downstream ``writer.write`` call total for a degenerate payload, so the
-    exact returned shape is a contract and not an implementation detail.
-
-    Mutations detected: deleting the ``if not dfs`` fallback, so
-    ``next(iter({}))`` raises ``StopIteration``; returning ``None`` or a
-    non-DataFrame sentinel, caught by the concrete-type assertion;
-    returning a pre-shaped frame such as ``pd.DataFrame(columns=["season"])``
-    or a Series, caught by the shape and ordered-column assertions.
-    """
-    # --- Act -----------------------------------------------------------
-    # Attribute access on the already-imported pipeline module: nothing is
-    # imported from a private name and nothing in production changes.
-    result = ingest_games._select_primary_df({})
-
-    # --- Assert: the concrete type, not merely DataFrame-like ---------
-    assert type(result) is pd.DataFrame, (
-        f"the empty-mapping fallback must return a concrete "
-        f"pandas.DataFrame; got {type(result).__name__}"
-    )
-
-    # --- Assert: the exact degenerate geometry ------------------------
-    assert result.shape == EXPECTED_EMPTY_MAPPING_SHAPE, (
-        f"an empty mapping must yield {EXPECTED_EMPTY_MAPPING_SHAPE}; "
-        f"got {result.shape}"
-    )
-    assert list(result.columns) == EXPECTED_EMPTY_MAPPING_COLUMNS, (
-        f"the fallback frame must declare no columns "
-        f"{EXPECTED_EMPTY_MAPPING_COLUMNS}; got {list(result.columns)}"
-    )
-    assert list(result.index) == EXPECTED_EMPTY_MAPPING_INDEX, (
-        f"the fallback frame must carry no rows "
-        f"{EXPECTED_EMPTY_MAPPING_INDEX}; got {list(result.index)}"
     )

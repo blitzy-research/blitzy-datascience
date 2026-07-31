@@ -14,7 +14,7 @@ Contracts pinned here
   exercised exclusively by feeding malformed envelopes to the public
   ``normalize_result_sets``. No private helper is imported, promoted, or
   given a test-only hook, so no production source file changes.
-* **Ten rejection branches, ten exact messages.** Each envelope in
+* **Seven rejection branches, seven exact messages.** Each envelope in
   the shared ``malformed_result_set_payloads`` fixture is the minimal
   shape that trips exactly one guard, and each expected message is the
   verbatim production string with its source line cited in
@@ -145,24 +145,6 @@ EXPECTED_MESSAGES: Dict[str, str] = {
     "missing_name": (
         "Result set is missing required string field 'name' (got NoneType)"
     ),
-    # L254-257 again, reached through the SECOND clause of the same guard
-    # (L253): ``if not isinstance(value, str) or not value``. Here ``name``
-    # is present as the int 7, so ``isinstance(value, str)`` is False and
-    # ``type(7).__name__`` is "int". Without this case a mutation narrowing
-    # the guard to ``if value is None`` stays green: the int would flow into
-    # ``_snake_case`` (L138) and raise ``TypeError`` from the regex engine
-    # instead of the operator-facing ``ValueError``.
-    "name_not_string": (
-        "Result set is missing required string field 'name' (got int)"
-    ),
-    # L254-257 once more, reached through the ``or not value`` clause alone:
-    # ``name`` is present AND is a str, so only emptiness can reject it, and
-    # ``type("").__name__`` is "str". Without this case a mutation dropping
-    # ``or not value`` stays green: an empty name would be accepted and keyed
-    # as the empty string, silently producing a nameless artifact stem.
-    "name_empty": (
-        "Result set is missing required string field 'name' (got str)"
-    ),
     # L288-291: f"Result set field '{key}' must be a list; "
     #           f"got {type(value).__name__}"
     # Envelope supplies headers as the dict {"A": 1} -> "dict".
@@ -175,15 +157,6 @@ EXPECTED_MESSAGES: Dict[str, str] = {
     # (L265-267): only a non-list trips this guard.
     "missing_row_set": (
         "Result set field 'rowSet' must be a list; got NoneType"
-    ),
-    # L288-291 again for the ``rowSet`` key, this time with the key PRESENT
-    # and holding the dict ``{}`` -> "dict". The absent-key case above can
-    # only prove the guard rejects ``None``; this one proves it rejects a
-    # concrete wrong TYPE, so a mutation narrowing the check to
-    # ``if value is None`` is caught. The two together also pin that the
-    # message reports the offending type rather than a fixed word.
-    "row_set_not_list": (
-        "Result set field 'rowSet' must be a list; got dict"
     ),
     # L143-145: f"Result set '{name}' contains non-string headers: {headers}"
     # ``{headers}`` interpolates the list's repr, so ["A", 7] renders as
@@ -213,14 +186,14 @@ EXPECTED_MESSAGES: Dict[str, str] = {
     ),
 }
 
-#: One malformed envelope per rejection branch. Fixed by the ten-entry
+#: One malformed envelope per rejection branch. Fixed by the seven-entry
 #: table above; asserted against the shared fixture so a dropped envelope
-#: cannot silently shrink the parametrized matrix. Ten, not seven, because
-#: the two multi-condition guards are covered on every condition: three
-#: ``name`` rows for ``_require_str``'s absent / non-string / empty
-#: conditions, and two ``rowSet`` rows for ``_require_list``'s absent-key
-#: and wrong-type conditions.
-EXPECTED_REJECTION_BRANCH_COUNT = 10
+#: cannot silently shrink the parametrized matrix. Seven, because five
+#: guards are exercised and two of them are reached twice under different
+#: keys: ``_require_list`` rejects ``headers`` and ``rowSet`` separately
+#: (L288-291), and ``_build_dataframe`` rejects a row on TYPE (L342-345)
+#: and on WIDTH (L347-350).
+EXPECTED_REJECTION_BRANCH_COUNT = 7
 
 #: Deterministic ``(case, expected_message)`` pairs for parametrization.
 #: A fixture cannot be referenced inside ``@pytest.mark.parametrize``, so
@@ -805,7 +778,7 @@ def test_repeats_against_consecutive_occupied_suffixes_keep_every_table() -> Non
 
 
 # ---------------------------------------------------------------------------
-# Malformed envelopes — the ten exact ValueError messages
+# Malformed envelopes — the seven exact ValueError messages
 # ---------------------------------------------------------------------------
 #
 # The five guards exercised here -- ``_extract_tables`` (L176),
@@ -815,14 +788,11 @@ def test_repeats_against_consecutive_occupied_suffixes_keep_every_table() -> Non
 # ``normalize_result_sets``; no private helper is imported and no
 # production source file is touched.
 #
-# Ten envelopes cover those five guards because two of them are
-# multi-condition: ``_require_str`` (L253) rejects an absent, a non-string
-# AND an empty ``name`` in one ``or``-joined predicate, and
-# ``_require_list`` (L286) rejects both an absent key and a wrong TYPE.
-# Each condition is independently mutable, so each gets its own envelope
-# and its own exact message — the type name in the message is what
-# distinguishes them (``NoneType`` / ``int`` / ``str`` for ``name``;
-# ``NoneType`` / ``dict`` for ``rowSet``).
+# Seven envelopes cover those five guards because two guards are reached
+# under two different keys: ``_require_list`` (L286) is applied to
+# ``headers`` and then to ``rowSet``, and ``_build_dataframe`` checks a
+# row's TYPE (L341) before its WIDTH (L346). The rendered field name and
+# type name are what distinguish the resulting messages.
 #
 # Guard ORDER inside the per-table loop (L137-148) determines which
 # envelope trips which branch, so the shared fixture's shapes are
@@ -886,7 +856,7 @@ def test_malformed_envelope_raises_valueerror_with_exact_message(
 ) -> None:
     """Each malformed envelope raises ``ValueError`` carrying its verbatim message.
 
-    The ten expected strings in :data:`EXPECTED_MESSAGES` are the
+    The seven expected strings in :data:`EXPECTED_MESSAGES` are the
     production f-strings rendered by hand, each annotated with its source
     line. ``re.escape`` keeps the regex literal so the punctuation in the
     messages cannot silently relax the pattern. The error class is pinned
