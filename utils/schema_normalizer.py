@@ -79,7 +79,12 @@ def normalize_result_sets(payload: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
         cell contains a ``dict`` or ``list``. Empty result sets
         (``rowSet`` is ``[]``) are returned as DataFrames with the
         correct columns and zero rows — this is legitimate upstream
-        behaviour for rare filter combinations.
+        behaviour for rare filter combinations. The mapping is
+        **loss-free**: ``len(result)`` always equals the number of
+        table entries in the envelope, because a name that repeats — or
+        whose generated ``_<n>`` key is already taken by a differently
+        named sibling — is assigned the first unoccupied ordinal rather
+        than overwriting an existing entry.
 
     Raises
     ------
@@ -122,9 +127,12 @@ def normalize_result_sets(payload: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
         )
 
     dataframes: Dict[str, pd.DataFrame] = {}
-    # Track duplicate names so collisions are suffixed deterministically
+    # Track duplicate names so repeats are suffixed deterministically
     # (e.g. two tables both named "PlayByPlay" -> "play_by_play",
-    # "play_by_play_2") rather than silently overwriting.
+    # "play_by_play_2") rather than silently overwriting. The ordinal is
+    # a STARTING POINT only: the loop below probes upward until the
+    # candidate key is genuinely free, because a differently named
+    # upstream table may already occupy it.
     seen_names: Dict[str, int] = {}
     for table in tables:
         name = _snake_case(_require_str(table, "name"))
@@ -140,9 +148,22 @@ def normalize_result_sets(payload: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
         _assert_rule4_flat(df, name)
 
         if name in dataframes:
-            seen_names[name] = seen_names.get(name, 1) + 1
-            deduped = f"{name}_{seen_names[name]}"
-            dataframes[deduped] = df
+            # Probe upward until the candidate key is UNOCCUPIED. A single
+            # ``seen_names.get(name, 1) + 1`` is not sufficient: the ordinal
+            # counts repeats of *this* name and is blind to a key that a
+            # differently named sibling table already holds. For the envelope
+            # ("PlayByPlay", "PlayByPlay_2", "PlayByPlay") the third table's
+            # first candidate is "play_by_play_2", which the SECOND table
+            # already owns — assigning it unconditionally would replace that
+            # table's DataFrame and drop it from the returned mapping with no
+            # error raised, silently discarding a whole upstream result set
+            # (three tables in, two frames out). Advancing to the first free
+            # ordinal keeps every table.
+            ordinal = seen_names.get(name, 1) + 1
+            while f"{name}_{ordinal}" in dataframes:
+                ordinal += 1
+            seen_names[name] = ordinal
+            dataframes[f"{name}_{ordinal}"] = df
         else:
             dataframes[name] = df
 
