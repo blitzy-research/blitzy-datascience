@@ -858,8 +858,10 @@ def test_row_narrower_than_headers_reports_index_count_and_declared_width(
     pinned rather than merely its presence.
 
     Mutation detected: changing the reported row index, the reported
-    value count, or the declared-header count; or moving the width check
-    somewhere that no longer names the offending row.
+    value count, or the declared-header count; comparing against the wrong
+    width (for example ``len(row_set)`` instead of ``len(headers)``); or
+    moving the width check somewhere that no longer names the offending
+    row.
     """
     # Arrange
     payload = malformed_result_set_payloads["row_width_mismatch"]
