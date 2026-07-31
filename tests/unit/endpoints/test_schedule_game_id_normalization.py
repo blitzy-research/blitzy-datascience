@@ -26,33 +26,6 @@ Four contracts are pinned here:
    single identifier. See the dedicated test at the bottom of this
    module.
 
-Hand-derived expected values
-----------------------------
-
-Every expected value in this module was derived by **reading the fixture
-and applying the helper's intended semantics on paper**, never by
-running :func:`enumerate_game_ids` and capturing what it returned. The
-arithmetic is shown beside each module-level constant and restated in
-the docstring of the test that consumes it. Snapshot-style assertions
-appear nowhere: there is no golden file, no record-then-compare helper,
-and no DataFrame comparison — this module constructs no DataFrames and
-imports no pandas symbols.
-
-Every test also names, in its docstring, the specific single-statement
-mutation it detects. **Mutation resistance, not line coverage, is the
-acceptance bar for this module**, so no test here settles for a "runs
-without error" or "output is non-empty" assertion.
-
-Test tier
----------
-
-No test here carries a pytest marker. ``pytest.ini`` registers exactly
-two markers (``integration`` and ``invariant``) under
-``--strict-markers``, so an unregistered marker would be a hard
-collection error. Unmarked tests land on the default offline tier and
-therefore run in every invocation mode, including ``-m "not
-integration"``.
-
 Log assertions
 --------------
 
@@ -68,17 +41,11 @@ substituted here. Message assertions use lenient substring matching so
 the production format string stays uncoupled from the test, matching the
 substring-matching convention used in ``test_schedule.py``.
 
-Rule compliance
----------------
-
-* Rule 1 (Single HTTP Client) — no ``import requests`` anywhere. Every
-  HTTP interaction is mediated by the handwritten ``RecordingClient``
-  spy obtained from the ``recording_client`` factory fixture in
-  :mod:`tests.conftest`; no network I/O occurs and no ``MagicMock`` is
-  used.
-* Rule 7 (Pluggable Storage) — no ``DataFrame.to_csv`` call and no
-  pandas import at all. This module emits no CSV and touches no
-  filesystem path.
+Every HTTP interaction is mediated by the handwritten
+``RecordingClient`` spy obtained from the ``recording_client`` factory
+fixture in :mod:`tests.conftest`, so no network I/O occurs; this module
+constructs no DataFrames, emits no CSV and touches no filesystem path.
+Each test names the specific single-statement mutation it detects.
 """
 from __future__ import annotations
 
@@ -87,14 +54,6 @@ import logging
 import config
 from endpoints import schedule
 
-
-# ---------------------------------------------------------------------------
-# Hand-derived expectations
-#
-# Every constant below was computed by reading the fixture rows and applying
-# the intended dedupe semantics on paper. None of these values was captured
-# from a run of the code under test.
-# ---------------------------------------------------------------------------
 
 #: Derived by hand from ``sample_schedule_payload``: its ``rowSet`` holds 5
 #: rows, and the ``GAME_ID`` column (``headers`` index 2) carries
@@ -519,29 +478,22 @@ def test_enumerate_game_ids_collapses_mixed_int_and_str_forms_of_one_game(
     while ``str("0022500001")`` is ``"0022500001"`` — **10**. Keying the dedupe
     on the unpadded string form therefore treats rows 1 and 2 as different
     games and returns ``["22500001", "0022500001", "0022500002"]`` — **three
-    identifiers for two games** — after which
-    ``pipelines.ingest_games.run`` fetches and appends that one game twice,
-    duplicating its rows in ``games.csv``. Widening each key to the
-    10-character zero-padded canonical form instead yields exactly 2
-    identifiers, every element 10 characters wide. The padding is idempotent,
-    so ``"0022500001"`` and ``"0022500002"`` pass through byte-identical.
+    identifiers for two games**. Widening each key to the 10-character
+    zero-padded canonical form instead yields exactly 2 identifiers, every
+    element 10 characters wide. The padding is idempotent, so
+    ``"0022500001"`` and ``"0022500002"`` pass through byte-identical.
 
-    Ten-character zero-padding is the canonical ``GAME_ID`` form throughout
-    this codebase: ``enumerate_game_ids``' own docstring promises
-    "10-character zero-padded identifiers such as ``0022500001``",
-    ``pipelines/ingest_games.py`` applies the mirror-image ``.str.zfill(10)``
-    normalization when matching pending identifiers against CSV cells, and
-    ``endpoints/games.py`` warns that stripping leading zeros corrupts the ID
-    so callers must preserve the string form upstream. The envelope is
-    realistic rather than contrived — the inline commentary in
-    ``endpoints/schedule.py`` records that the upstream occasionally returns
-    numeric types for identifiers that look numeric — and nothing downstream
-    would absorb the duplicate, because ``utils/checkpoint.py::get_pending``
-    returns the original elements verbatim in their original order.
+    The 10-character form is the one ``enumerate_game_ids``' own docstring
+    promises, and :mod:`pipelines.ingest_games` applies the mirror-image
+    ``.str.zfill(10)`` when matching pending identifiers against CSV cells.
 
     Mutation detected: dropping the ``zfill(10)`` widening from the key
-    derivation, leaving a bare ``str(game_id)``. That reintroduces the
-    3-identifiers-for-2-games leak and fails all three assertions below.
+    derivation, leaving a bare ``str(game_id)``. Duplicate identifiers reach
+    the games pipeline, which fetches and appends the same game twice, and
+    nothing downstream absorbs them because
+    ``utils.checkpoint.CheckpointManager.get_pending`` returns the original
+    elements verbatim in their original order. All three assertions below
+    fail.
     """
     # Arrange
     client = recording_client(

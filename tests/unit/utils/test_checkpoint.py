@@ -562,12 +562,11 @@ def test_rule5_checkpoint_round_trip_alias(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase 2.15 — `get_pending` duplicate / element-type / order guarantees
+# `get_pending` duplicate / element-type / order guarantees
 # ---------------------------------------------------------------------------
 #
 # Four contracts of :meth:`utils.checkpoint.CheckpointManager.get_pending`,
-# every expected value derived BY HAND from the method's documented behaviour
-# rather than from a captured run:
+# each expected value following from the method's documented behaviour:
 #   1. Duplicate INPUT keys survive verbatim — the filter is applied against
 #      the set of COMPLETED keys, and ``all_keys`` is never deduplicated.
 #   2. Surviving elements are the ORIGINAL objects with their original types;
@@ -609,7 +608,7 @@ def test_get_pending_does_not_deduplicate_duplicate_input_keys(tmp_path: Path) -
 
     # Assert — the whole ordered list, duplicate included.
     assert pending == ["a", "a", "b"], (
-        "get_pending must not deduplicate its own input (utils/checkpoint.py L548 is a plain "
+        "get_pending must not deduplicate its own input (its return statement is a plain "
         f"order-preserving comprehension); expected ['a', 'a', 'b'] but got {pending!r}"
     )
     assert len(pending) == 3, (
@@ -679,7 +678,7 @@ def test_get_pending_returns_original_element_objects_not_string_coercions(tmp_p
     # Assert — the same values ...
     assert pending == [1, 2], (
         "get_pending must return the original elements, not their str() forms "
-        f"(utils/checkpoint.py L548 emits k, never str(k)); expected [1, 2] but got {pending!r}"
+        f"(the comprehension emits k, never str(k)); expected [1, 2] but got {pending!r}"
     )
     # ... and the same concrete types (type identity, deliberately not isinstance).
     assert all(type(k) is int for k in pending), (
@@ -721,7 +720,7 @@ def test_get_pending_preserves_unsorted_input_order_with_middle_key_completed(tm
 
     # Assert — the whole ordered list, which is NOT the sorted list.
     assert pending == ["0022500003", "0022500001", "0022500004"], (
-        "get_pending must preserve input order (utils/checkpoint.py L503-506); expected "
+        "get_pending must preserve input order, as its own docstring promises; expected "
         f"['0022500003', '0022500001', '0022500004'] but got {pending!r}"
     )
     assert len(pending) == 3, (

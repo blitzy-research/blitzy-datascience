@@ -1141,10 +1141,9 @@ def fake_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
 # Canonical mini-season fixtures — hand-derived, mutation-sensitive test data
 # ---------------------------------------------------------------------------
 #
-# The five fixtures below hold **input** data only: every value is a literal,
-# never a value produced by running a pipeline. The expected values a consuming
-# test compares against are derived by hand in that test module, which is what
-# keeps the "no snapshot assertions" contract auditable.
+# The five fixtures below hold **input** data only: every value is a literal.
+# The expected values a consuming test compares against are derived from these
+# literals in that test module.
 #
 # Within each artifact the per-game row counts vary rather than repeat, and the
 # box-score distribution differs from the play-by-play one. That variation is
@@ -1373,20 +1372,16 @@ def schedule_mixed_game_id_payload() -> Dict[str, Any]:
 
     The int-versus-str asymmetry between rows 1 and 2 is the entire point:
     row 1's cell is a bare Python :class:`int`, with no quotes and no
-    leading zeros. The shape is realistic rather than contrived — the
-    inline commentary in ``endpoints/schedule.py`` records that the upstream
-    occasionally returns numeric types for identifiers that look numeric.
+    leading zeros, which is a shape the upstream service does return for
+    identifiers that look numeric.
 
     The keying arithmetic follows from that asymmetry: ``str(22500001)`` is
-    eight characters while ``str("0022500001")`` is ten, so deduplicating on
-    the unpadded string form keys these three rows as ``['22500001',
-    '0022500001', '0022500002']`` — **three identifiers for two games**,
-    which has a games pipeline fetch and append one game twice and duplicate
-    its rows in ``games.csv``. ``CheckpointManager.get_pending`` cannot
-    absorb such a duplicate, because it is an order-preserving filter that
-    does not deduplicate its input. Keying on the 10-character zero-padded
-    canonical form instead yields ``['0022500001', '0022500002']`` — two
-    identifiers, every element ten characters wide.
+    eight characters while ``str("0022500001")`` is ten, so keying on the
+    unpadded string form yields ``['22500001', '0022500001', '0022500002']``
+    — three identifiers for two games. Keying on the 10-character
+    zero-padded canonical form yields ``['0022500001', '0022500002']`` — two
+    identifiers, every element ten characters wide, which is the expected
+    result for this envelope.
     """
     return {
         "resource": "leaguegamefinder",
@@ -1407,16 +1402,19 @@ def schedule_mixed_game_id_payload() -> Dict[str, Any]:
 
 @pytest.fixture
 def malformed_result_set_payloads() -> Dict[str, Any]:
-    """Seven payloads, one per ``normalize_result_sets`` rejection branch.
+    """Seven malformed payloads covering seven distinct ``ValueError`` outcomes.
 
     Supplies the malformed-envelope inputs for schema-normalizer validation
     tests, keyed by case name so the cases can be parametrized and matched
-    against exact :class:`ValueError` message text. The branches sit in
+    against exact :class:`ValueError` message text. The guards live in
     ``_extract_tables``, ``_require_str``, ``_require_list``, the
     non-string-headers check in ``normalize_result_sets``, and the row type
-    and width checks in ``_build_dataframe`` — each reached through the
-    public ``utils.schema_normalizer.normalize_result_sets`` entry point
-    rather than by importing a private helper.
+    and width checks in ``_build_dataframe``; ``_require_list`` accounts for
+    two of the seven outcomes because it is applied to ``headers`` and to
+    ``rowSet`` separately, and ``_build_dataframe`` for two more because a row
+    can fail on type or on width. Every case is reached through the public
+    ``utils.schema_normalizer.normalize_result_sets`` entry point rather than
+    by importing a private helper.
 
     Each envelope is the minimal shape that trips exactly one branch. That
     requires care about evaluation order inside ``normalize_result_sets``:

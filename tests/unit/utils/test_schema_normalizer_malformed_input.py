@@ -4,8 +4,8 @@ Covers the **parsing** and **type-coercion** stages of the ingestion
 pipeline: the validation gate of
 :func:`utils.schema_normalizer.normalize_result_sets` and the pandas
 dtype-inference behaviour of the single
-``pd.DataFrame(row_set, columns=headers)`` construction site
-(``utils/schema_normalizer.py`` line 352).
+``pd.DataFrame(row_set, columns=headers)`` construction site inside
+``_build_dataframe``.
 
 Contracts pinned here
 ---------------------
@@ -13,19 +13,19 @@ Contracts pinned here
   ``_extract_tables``, ``_require_str``, and ``_require_list`` are
   exercised exclusively by feeding malformed envelopes to the public
   ``normalize_result_sets``. No private helper is imported, promoted, or
-  given a test-only hook, so no production source file changes.
-* **Seven rejection branches, seven exact messages.** Each envelope in
+  given a test-only hook.
+* **Seven rejection outcomes, seven exact messages.** Each envelope in
   the shared ``malformed_result_set_payloads`` fixture is the minimal
-  shape that trips exactly one guard, and each expected message is the
-  verbatim production string with its source line cited in
-  :data:`EXPECTED_MESSAGES`. Because ``pytest.raises(match=...)``
-  performs a :func:`re.search`, every pattern is wrapped in
-  :func:`re.escape` — the messages contain ``'``, ``[``, ``]``, ``(``,
-  and ``)``, any of which would silently alter an unescaped pattern and
-  make the assertion pass for the wrong reason. Every case additionally
-  asserts full-string ``==`` equality alongside the containment match,
-  and the row-width branch carries a dedicated boundary test that does
-  the same — both strictly stronger than a containment search.
+  shape that trips exactly one guard, and each expected message in
+  :data:`EXPECTED_MESSAGES` is the verbatim production string. Because
+  ``pytest.raises(match=...)`` performs a :func:`re.search`, every
+  pattern is wrapped in :func:`re.escape` — the messages contain ``'``,
+  ``[``, ``]``, ``(``, and ``)``, any of which would silently alter an
+  unescaped pattern and make the assertion pass for the wrong reason.
+  Every case additionally asserts full-string ``==`` equality alongside
+  the containment match, and the row-width branch carries a dedicated
+  boundary test that does the same — both strictly stronger than a
+  containment search.
 * **The dtype and null contract is pinned exactly.** An integer column
   containing ``None`` upcasts to ``float64`` with ``NaN``, while an
   object column preserves ``None`` as the literal ``None`` — yet
@@ -40,14 +40,13 @@ Contracts pinned here
 * **Duplicate names are uniquified, never overwritten.** A name that
   repeats within one envelope is suffixed with the next free ordinal
   (``PlayByPlay`` twice -> ``play_by_play`` and ``play_by_play_2``)
-  instead of the second table
-  replacing the first, and the near-miss spelling that merely
-  *resembles* a generated key stays distinct from it: an upstream name
-  already ending in a digit snake-cases to ``play_by_play2`` (no
-  underscore) while the generated suffix is ``play_by_play_2`` (with
-  one). Both hand-derived key lists in AAP §0.4.2.3 are pinned —
-  ``['x', 'x_2', 'x_3']`` by the sibling ``test_schema_normalizer.py``
-  and ``['play_by_play', 'play_by_play2', 'play_by_play_2']`` here.
+  instead of the second table replacing the first, and the near-miss
+  spelling that merely *resembles* a generated key stays distinct from
+  it: an upstream name already ending in a digit snake-cases to
+  ``play_by_play2`` (no underscore) while the generated suffix is
+  ``play_by_play_2`` (with one). The key list
+  ``['play_by_play', 'play_by_play2', 'play_by_play_2']`` is pinned
+  here.
 * **The occupied-generated-suffix case is LOSS-FREE, and that is
   asserted as an equality.** When the ordinal the uniquifier computes
   names a key an earlier table already holds, the uniquifier probes
@@ -56,48 +55,15 @@ Contracts pinned here
   Two tests below pin that exactly — the ordered key list, the frame
   count against the upstream table count, and one distinguishing cell
   per frame, because a correct key list alone cannot detect an
-  overwrite. Both were the failing cases that motivated **CD-2**, the
-  minimal three-statement probe fix in ``utils/schema_normalizer.py``
-  (L150-166) exercised under Constraint C2's "genuine bug found"
-  allowance (AAP §0.1.4) and called out with its failing case in the
-  section banner below. Before that fix, ``PlayByPlay`` /
-  ``PlayByPlay_2`` / ``PlayByPlay`` returned two frames for three tables
-  with cells ``[1, 3]`` — silent upstream data loss with no exception
-  raised.
-* **Every expected value is hand-derived, never captured.** Each
-  constant below is justified by the production source lines cited
-  beside it — no assertion compares against recorded output, no
-  snapshot or golden file is used, and
-  :func:`pandas.testing.assert_frame_equal` is never applied to a
-  code-produced frame.
+  overwrite.
 * **No test doubles at all.** ``normalize_result_sets`` is a pure
   function over a JSON-like envelope with no I/O, so mocking at the
   boundary of the code under test would violate the repository
   convention. Inputs are literal dicts plus the one shared fixture; no
   mock, spy, monkeypatch, filesystem, network, or metrics access
   appears here.
-* **Offline tier, no marker.** ``pytest.ini`` registers exactly two
-  markers (``integration`` and ``invariant``) under
-  ``--strict-markers``, so this module carries none and runs in every
-  invocation mode. It is auto-collected without any configuration
-  change because ``pytest.ini`` sets ``python_files = test_*.py``.
-* **Rule 4 is deliberately absent.** Nested-cell rejection and generic
-  flatness are owned by
-  ``tests/invariants/test_rule4_no_nested_cells.py``; re-asserting them
-  here would add no fault detection.
 
-Mutation resistance — not a coverage percentage — is the acceptance bar,
-so every test below names the specific change it detects. This project
-ships no coverage instrument by design (``pytest-cov`` and ``coverage``
-are absent and forbidden by the ``tests/conftest.py`` do-not list), and
-no percentage is claimed anywhere.
-
-Authoritative references
-------------------------
-* ``utils/schema_normalizer.py`` — the production contract; every line
-  number cited below was read from that file.
-* ``tests/conftest.py`` — the shared ``malformed_result_set_payloads``
-  fixture consumed by the parametrized error-case matrix.
+Every test below names the specific change it detects.
 """
 
 from __future__ import annotations
@@ -115,84 +81,66 @@ from utils.schema_normalizer import normalize_result_sets
 # Hand-derived expected values (kept separate from fixture INPUT values)
 # ---------------------------------------------------------------------------
 #
-# Every constant in this section is derived independently from the
-# production source rather than from a recorded run. The line references
-# point at ``utils/schema_normalizer.py`` and each derivation is spelled
-# out beside the literal it produces.
+# Every constant in this section is derived from the production
+# contract, and each derivation is spelled out beside the literal it
+# produces.
 # ---------------------------------------------------------------------------
 
-#: Verbatim ``ValueError`` text for each rejection branch, keyed by the
+#: Verbatim ``ValueError`` text for each rejection outcome, keyed by the
 #: case names used in ``tests/conftest.py::malformed_result_set_payloads``.
 #:
-#: Each string is the f-string at the cited line rendered with that
+#: Each string is the message the corresponding guard renders for that
 #: envelope's values. The result-set name is ``"t"`` throughout because
-#: ``_snake_case("t")`` is ``"t"``: neither ``_CAMEL_BOUNDARY_1``
-#: (``(.)([A-Z][a-z]+)``, L417) nor ``_CAMEL_BOUNDARY_2``
-#: (``([a-z0-9])([A-Z])``, L421) matches a single lowercase character,
-#: and ``.lower().strip("_")`` leaves it untouched (L454-456).
+#: ``_snake_case("t")`` is ``"t"``: neither camel-boundary pattern
+#: (``(.)([A-Z][a-z]+)`` and ``([a-z0-9])([A-Z])``) matches a single
+#: lowercase character, and ``.lower().strip("_")`` leaves it untouched.
 EXPECTED_MESSAGES: Dict[str, str] = {
-    # L347-350: f"Result set '{name}' row {idx} has {len(row)} values "
-    #           f"but {expected_width} headers are declared"
-    # Envelope: headers ["A", "B", "C"] (width 3) against rowSet [[1, 2]]
-    # (row 0, length 2) -> idx=0, len(row)=2, expected_width=3.
     "row_width_mismatch": (
         "Result set 't' row 0 has 2 values but 3 headers are declared"
     ),
-    # L254-257: f"Result set is missing required string field '{key}' "
-    #           f"(got {type(value).__name__})"
-    # Envelope omits "name" entirely, so ``table.get("name")`` (L252) is
-    # ``None`` and ``type(None).__name__`` is "NoneType".
     "missing_name": (
         "Result set is missing required string field 'name' (got NoneType)"
     ),
-    # L288-291: f"Result set field '{key}' must be a list; "
-    #           f"got {type(value).__name__}"
-    # Envelope supplies headers as the dict {"A": 1} -> "dict".
     "headers_not_list": (
         "Result set field 'headers' must be a list; got dict"
     ),
-    # L288-291 again, reached for the ``rowSet`` key on the next line
-    # (L140). The envelope omits "rowSet", so ``table.get("rowSet")`` is
-    # ``None`` -> "NoneType". An EMPTY list would be valid here
-    # (L265-267): only a non-list trips this guard.
+    # ``_require_list`` reached for the ``rowSet`` key rather than
+    # ``headers``. An EMPTY list is valid here; only a non-list trips the
+    # guard, and an omitted key arrives as ``None`` -> "NoneType".
     "missing_row_set": (
         "Result set field 'rowSet' must be a list; got NoneType"
     ),
-    # L143-145: f"Result set '{name}' contains non-string headers: {headers}"
-    # ``{headers}`` interpolates the list's repr, so ["A", 7] renders as
-    # ['A', 7] -- note the single quotes around A and the space after the
-    # comma. This guard (L142) runs AFTER both _require_list calls, so the
-    # envelope must still carry a valid name and a list-typed rowSet.
+    # The message interpolates the header list's repr, so ["A", 7]
+    # renders as ['A', 7] -- note the single quotes around A and the
+    # space after the comma. This guard runs AFTER both _require_list
+    # calls, so the envelope must still carry a valid name and a
+    # list-typed rowSet.
     "non_string_header": (
         "Result set 't' contains non-string headers: ['A', 7]"
     ),
-    # L342-345: f"Result set '{name}' row {idx} is {type(row).__name__}, "
-    #           f"expected list/tuple"
     # The envelope's row is the dict {"A": 1} against the single header
-    # ["A"], so the row TYPE check (L341) is the only guard it can trip:
-    # the width check (L346) sees len(row) == expected_width == 1. The
-    # rendered type name is therefore "dict" and the row index is 0,
-    # keeping this entry a clean single-branch probe of the TYPE guard.
+    # ["A"], so the row TYPE check is the only guard it can trip: the
+    # width check sees len(row) == expected_width == 1. The rendered type
+    # name is therefore "dict" and the row index is 0, keeping this entry
+    # a clean single-branch probe of the TYPE guard.
     "row_not_sequence": (
         "Result set 't' row 0 is dict, expected list/tuple"
     ),
-    # L214-216: f"'resultSets' must be a list or dict, got {type(raw).__name__}"
-    # The envelope supplies the str "not-a-list" -> "str". This is the
-    # _extract_tables TYPE guard, distinct from the "Payload contains no
-    # result sets" message (L124-127) raised when the extracted table
+    # The ``_extract_tables`` TYPE guard, distinct from the "Payload
+    # contains no result sets" message raised when the extracted table
     # list is empty.
     "result_sets_wrong_type": (
         "'resultSets' must be a list or dict, got str"
     ),
 }
 
-#: One malformed envelope per rejection branch. Fixed by the seven-entry
-#: table above; asserted against the shared fixture so a dropped envelope
-#: cannot silently shrink the parametrized matrix. Seven, because five
-#: guards are exercised and two of them are reached twice under different
-#: keys: ``_require_list`` rejects ``headers`` and ``rowSet`` separately
-#: (L288-291), and ``_build_dataframe`` rejects a row on TYPE (L342-345)
-#: and on WIDTH (L347-350).
+#: Number of distinct rejection outcomes the shared fixture must cover.
+#: Fixed by the seven-entry table above; asserted against the fixture so
+#: a dropped envelope cannot silently shrink the parametrized matrix.
+#: Seven, because five guards are exercised and two of them are reached
+#: twice under different keys: ``_require_list`` rejects ``headers`` and
+#: ``rowSet`` separately, and ``_build_dataframe`` rejects a row on TYPE
+#: and on WIDTH.
 EXPECTED_REJECTION_BRANCH_COUNT = 7
 
 #: Deterministic ``(case, expected_message)`` pairs for parametrization.
@@ -204,12 +152,12 @@ MALFORMED_CASES: tuple[tuple[str, str], ...] = tuple(
 )
 
 #: Headers of the inline dtype-probe envelope, in upstream order. The
-#: normalizer passes ``headers`` straight through as ``columns`` (L352),
-#: so column identity and order must survive verbatim.
+#: normalizer passes ``headers`` straight through as the frame's
+#: ``columns``, so column identity and order must survive verbatim.
 EXPECTED_DTYPE_COLUMNS: list[str] = ["PLAYER_ID", "PTS", "NOTE"]
 
 #: pandas dtype inference for ``pd.DataFrame(row_set, columns=headers)``
-#: -- the sole construction site (L352) -- over the rowSet
+#: -- the sole construction site -- over the rowSet
 #: ``[[203999, None, "ok"], [1629029, 31, None]]``:
 #:
 #: * ``PLAYER_ID`` holds two Python ints and nothing else -> ``int64``.
@@ -234,17 +182,16 @@ EXPECTED_NOTE_NULL_MASK: list[bool] = [False, True]
 
 #: Keys produced by the duplicate-name NEAR-MISS envelope, whose tables
 #: are named ``PlayByPlay``, ``PlayByPlay2``, ``PlayByPlay`` in that
-#: order. It is the second of the two key lists AAP §0.4.2.3 derives by
-#: hand, and it is a near miss rather than an exact clash: the digit
-#: suffix the upstream itself supplies (``play_by_play2``) differs by one
+#: order. It is a near miss rather than an exact clash: the digit suffix
+#: the upstream itself supplies (``play_by_play2``) differs by one
 #: character from the suffix the uniquifier generates
 #: (``play_by_play_2``), so all three tables keep their own key.
-#: Derivation, traced through both ``_snake_case`` regexes (L417 / L421 /
-#: L454-456) and the uniquifier (L150-166):
+#: Derivation, traced through both ``_snake_case`` camel-boundary
+#: substitutions and the uniquifier:
 #:
-#: * ``"PlayByPlay"``: ``_CAMEL_BOUNDARY_1`` matches ``"yBy"`` at
-#:   offset 3 -> ``"Play_ByPlay"``; ``_CAMEL_BOUNDARY_2`` then matches
-#:   ``"yP"`` -> ``"Play_By_Play"``; lower/strip -> ``"play_by_play"``.
+#: * ``"PlayByPlay"``: the first camel boundary matches ``"yBy"`` at
+#:   offset 3 -> ``"Play_ByPlay"``; the second then matches ``"yP"`` ->
+#:   ``"Play_By_Play"``; lower/strip -> ``"play_by_play"``.
 #: * ``"PlayByPlay2"``: the same two substitutions give
 #:   ``"Play_By_Play2"`` -> ``"play_by_play2"``. There is NO underscore
 #:   before the digit, so it is a genuinely DIFFERENT key from the
@@ -277,13 +224,13 @@ CONSECUTIVE_SUFFIX_TABLE_COUNT = 5
 #: order. Unlike the near miss above, the second table's own upstream name
 #: snake-cases to EXACTLY the key the uniquifier's first candidate would
 #: use for the third, so the two contend for one key and the probe loop is
-#: what keeps both tables. Derivation, traced through the same regexes
-#: (L417 / L421 / L454-456) and the uniquifier (L150-166):
+#: what keeps both tables. Derivation, traced through the same
+#: camel-boundary substitutions and the uniquifier:
 #:
 #: * table 1 ``"PlayByPlay"`` -> ``"play_by_play"``; the key is free, so
 #:   ``dataframes["play_by_play"] = <table 1>``.
-#: * table 2 ``"PlayByPlay_2"``: ``_CAMEL_BOUNDARY_1`` gives
-#:   ``"Play_ByPlay_2"``, ``_CAMEL_BOUNDARY_2`` gives ``"Play_By_Play_2"``,
+#: * table 2 ``"PlayByPlay_2"``: the first camel boundary gives
+#:   ``"Play_ByPlay_2"``, the second gives ``"Play_By_Play_2"``,
 #:   lower/strip -> ``"play_by_play_2"``. That name is NOT yet a key, so it
 #:   takes the bare form: ``dataframes["play_by_play_2"] = <table 2>``.
 #: * table 3 ``"PlayByPlay"`` -> ``"play_by_play"``, which IS a key, so the
@@ -302,9 +249,10 @@ EXPECTED_OCCUPIED_SUFFIX_KEYS: list[str] = [
 
 #: First-column cell of each frame, in key order. Each key holds its OWN
 #: table's data: table 1's ``1``, table 2's ``2`` under the key that table
-#: 2 named itself, and table 3's ``3`` under the probed-forward key. Under
-#: the pre-fix single-ordinal assignment this list read ``[1, 3]`` — the
-#: missing ``2`` was table 2's frame, silently replaced.
+#: 2 named itself, and table 3's ``3`` under the probed-forward key. A
+#: uniquifier that assigned its first candidate ordinal without probing
+#: would return ``[1, 3]`` instead, the missing ``2`` being table 2's
+#: silently replaced frame.
 EXPECTED_OCCUPIED_SUFFIX_CELLS: list[int] = [1, 2, 3]
 
 #: Keys produced by the CONSECUTIVE-occupancy envelope, whose tables are
@@ -323,14 +271,14 @@ EXPECTED_OCCUPIED_SUFFIX_CELLS: list[int] = [1, 2, 3]
 #: * table 5 ``X`` repeats ``x``: the starting ordinal ``4 + 1 == 5`` names
 #:   the free ``x_5`` -> cell 5.
 #:
-#: Result: FIVE keys for FIVE upstream tables. Under the pre-fix ordinal
-#: this envelope returned only THREE frames, with tables 2 and 3 replaced.
+#: Result: FIVE keys for FIVE upstream tables. Without the probe this
+#: envelope would return only THREE frames, tables 2 and 3 replaced.
 EXPECTED_CONSECUTIVE_SUFFIX_KEYS: list[str] = ["x", "x_2", "x_3", "x_4", "x_5"]
 
 #: First-column cell of each frame, in key order. The identity mapping
 #: ``[1, 2, 3, 4, 5]`` is the loss-free property stated as data: every
-#: upstream table's own row is reachable under its own key. Under the
-#: pre-fix ordinal this list read ``[1, 4, 5]``.
+#: upstream table's own row is reachable under its own key. Without the
+#: probe this list would read ``[1, 4, 5]``.
 EXPECTED_CONSECUTIVE_SUFFIX_CELLS: list[int] = [1, 2, 3, 4, 5]
 
 
@@ -339,7 +287,7 @@ EXPECTED_CONSECUTIVE_SUFFIX_CELLS: list[int] = [1, 2, 3, 4, 5]
 # ---------------------------------------------------------------------------
 #
 # ``_build_dataframe`` ends in a single
-# ``pd.DataFrame(row_set, columns=headers)`` call (L352) and performs no
+# ``pd.DataFrame(row_set, columns=headers)`` call and performs no
 # value repair whatsoever: the helper body contains no ``astype``, no
 # ``to_numeric``, no ``fillna``, and no ``convert_dtypes``. Whatever
 # pandas infers from the literal rowSet is therefore the normalizer's
@@ -483,17 +431,18 @@ def test_numeric_supplied_as_string_is_not_coerced_to_a_number() -> None:
     """A numeric arriving as the string ``"31"`` stays an ``object``-dtype ``str``.
 
     ``_build_dataframe`` performs faithful structural translation, not
-    value repair: its body (L295-352) contains no ``astype``, no
-    ``to_numeric``, no ``fillna``, and no ``convert_dtypes``. A column of
-    two strings therefore infers ``object``, and each cell remains the
-    exact ``str`` the envelope supplied. The neighbouring ``PLAYER_ID``
-    column proves genuine integers are still inferred as ``int64``, so
-    the ``object`` result is specific to the string input rather than a
-    blanket loss of inference.
+    value repair: its body contains no ``astype``, no ``to_numeric``, no
+    ``fillna``, and no ``convert_dtypes``. A column of two strings
+    therefore infers ``object``, and each cell remains the exact ``str``
+    the envelope supplied. The neighbouring ``PLAYER_ID`` column proves
+    genuine integers are still inferred as ``int64``, so the ``object``
+    result is specific to the string input rather than a blanket loss of
+    inference.
 
     Mutation detected: introducing ``pd.to_numeric`` "for convenience",
-    which would silently rewrite the on-disk representation of every
-    downstream CSV artifact.
+    which would change the normalized frame's dtype and the Python type
+    of every cell in it before any downstream consumer receives the
+    frame.
     """
     # Arrange
     payload: Dict[str, Any] = {
@@ -536,19 +485,14 @@ def test_numeric_supplied_as_string_is_not_coerced_to_a_number() -> None:
 #
 # Duplicate names are a duplicate-record concern inside the PARSING
 # stage: two tables sharing a name must both survive, because the
-# uniquifier (L150-166) is the only thing standing between a repeated
-# upstream name and one table's data vanishing from the output.
+# uniquifier is the only thing standing between a repeated upstream name
+# and one table's data vanishing from the output.
 #
-# The envelope exercised here is the second of the two key lists AAP
-# §0.4.2.3 derives by hand: ``PlayByPlay``, ``PlayByPlay2``,
+# The envelope exercised here is ``PlayByPlay``, ``PlayByPlay2``,
 # ``PlayByPlay``. ``PlayByPlay2`` snake-cases to ``play_by_play2`` (no
 # underscore) while the repeated ``PlayByPlay`` is suffixed to
 # ``play_by_play_2`` (with one), so the two spellings stay one character
-# apart and all three tables keep their own key and their own data. The
-# first of the two lists — three tables all named ``X`` yielding
-# ``['x', 'x_2', 'x_3']`` — is owned by the sibling module
-# ``tests/unit/utils/test_schema_normalizer.py`` and is deliberately not
-# duplicated here.
+# apart and all three tables keep their own key and their own data.
 # ---------------------------------------------------------------------------
 
 
@@ -562,10 +506,9 @@ def test_duplicate_name_beside_a_digit_suffixed_sibling_keeps_every_table() -> N
     ``seen_names.get("play_by_play", 1) + 1 == 2``. Three tables in,
     three frames out, each holding its own row.
 
-    This is the exact key list AAP §0.4.2.3 derives by hand for this
-    envelope, and it is asserted as a whole ordered list together with
-    the distinguishing first cell of every frame — a correct key list
-    alone cannot detect an overwrite, only the cells can.
+    The key list is asserted as a whole ordered list together with the
+    distinguishing first cell of every frame — a correct key list alone
+    cannot detect an overwrite, only the cells can.
 
     Mutations detected: replacing the suffixing with plain assignment --
     the third table would overwrite the first, leaving two keys and the
@@ -607,52 +550,25 @@ def test_duplicate_name_beside_a_digit_suffixed_sibling_keeps_every_table() -> N
 
 
 # ---------------------------------------------------------------------------
-# Duplicate result-set names — the OCCUPIED-suffix case, loss-free (CD-2)
+# Duplicate result-set names — the OCCUPIED-suffix case, loss-free
 # ---------------------------------------------------------------------------
 #
 # The near-miss envelope above never contends for a key because the
 # sibling's spelling (``play_by_play2``) differs from the generated key
-# (``play_by_play_2``). When the two coincide, the uniquifier's ordinal
-# must be a STARTING POINT rather than a verdict, and the two tests below
-# pin exactly that: every upstream table survives under its own key.
+# (``play_by_play_2``). When the two coincide, the ordinal the uniquifier
+# computes is a STARTING POINT rather than a verdict: a generated suffix
+# may already be occupied by an upstream name of its own, so the
+# uniquifier probes upward to the first free ordinal and every input
+# table keeps a frame of its own under a key of its own.
 #
-# CD-2 — THE DEFECT THESE TESTS MOTIVATED, with its failing case:
-#
-#   Before the fix, the uniquifier computed ONE candidate key and assigned
-#   to it unconditionally. For an envelope naming its tables
-#   ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay`` the third table's
-#   candidate key ``play_by_play_2`` was already held by the SECOND table,
-#   whose own upstream name snake-cases to that exact string. The
-#   assignment replaced table 2's DataFrame, so the mapping held
-#   ``{'play_by_play': <table 1>, 'play_by_play_2': <table 3>}`` — THREE
-#   tables in, TWO frames out, cells ``[1, 3]``, and no exception raised.
-#   A whole upstream result set disappeared silently, which contradicts
-#   the function's own ``Returns`` contract (faithful structural
-#   translation of every table in the envelope) and is data loss rather
-#   than a cosmetic naming quirk.
-#
-# THE MINIMAL FIX (``utils/schema_normalizer.py`` L150-166, three added
-# statements) — probe forward to the first FREE ordinal:
-#
-#   ordinal = seen_names.get(name, 1) + 1
-#   while f"{name}_{ordinal}" in dataframes:
-#       ordinal += 1
-#   seen_names[name] = ordinal
-#   dataframes[f"{name}_{ordinal}"] = df
-#
-# It changes no signature, adds no import and alters no control flow other
-# than the probe, and it leaves every previously asserted key sequence
-# intact: three tables all named ``X`` still yield ``['x', 'x_2', 'x_3']``
-# (frozen sibling module ``tests/unit/utils/test_schema_normalizer.py``)
-# and the near-miss envelope above still yields
-# ``['play_by_play', 'play_by_play2', 'play_by_play_2']``. Both facts are
-# re-proved by the suite rather than asserted here.
-#
-# Scope note: the fix is exercised under Constraint C2, which permits a
-# non-test source change "to fix a genuine bug found" provided it is
-# minimal and called out explicitly with the failing case that motivated
-# it (AAP §0.1.4). The failing case is the envelope above; the call-out is
-# this banner plus the resolution report.
+# That is the whole contract the two tests below pin, and it is asserted
+# as an equality — the number of frames returned equals the number of
+# tables supplied — because a key list alone cannot reveal that one
+# table's frame replaced another's. Assigning a single computed ordinal
+# without probing would return two frames for the three tables named
+# ``PlayByPlay`` / ``PlayByPlay_2`` / ``PlayByPlay``, with no exception
+# raised, contradicting the function's ``Returns`` contract of a faithful
+# structural translation of every table in the envelope.
 # ---------------------------------------------------------------------------
 
 
@@ -671,8 +587,8 @@ def test_repeat_whose_generated_key_is_occupied_keeps_every_table() -> None:
     something merely implied by a key list.
 
     Mutations detected: deleting the ``while`` probe so the single ordinal
-    is assigned unconditionally (CD-2 itself — two frames for three tables,
-    cells ``[1, 3]``); dropping the uniquifier entirely so a repeat
+    is assigned unconditionally (two frames for three tables, cells
+    ``[1, 3]``); dropping the uniquifier entirely so a repeat
     overwrites the BARE key (cells ``[3, 2]``); renumbering the ordinal
     from ``_1``; and changing the ``_`` separator (the key list changes).
     """
@@ -699,7 +615,7 @@ def test_repeat_whose_generated_key_is_occupied_keeps_every_table() -> None:
         f"every upstream table must survive: {OCCUPIED_SUFFIX_TABLE_COUNT} "
         f"tables were supplied but {len(out)} frames were returned. A count "
         f"below {OCCUPIED_SUFFIX_TABLE_COUNT} means a generated key "
-        f"overwrote a sibling table's frame (CD-2)"
+        f"overwrote a sibling table's frame"
     )
 
     # Assert -- each key holds its OWN table's data, so nothing was
@@ -731,7 +647,7 @@ def test_repeats_against_consecutive_occupied_suffixes_keep_every_table() -> Non
     Mutations detected: replacing the ``while`` probe with a single ``if``
     (table 4 would advance only to the occupied ``x_3`` and displace table
     3, yielding four frames and cells ``[1, 2, 4, 5]``); deleting the probe
-    altogether (CD-2 — three frames, cells ``[1, 4, 5]``); and keying a
+    altogether (three frames, cells ``[1, 4, 5]``); and keying a
     repeat off the bare name (one frame). Deliberately NOT claimed:
     dropping the ``seen_names[name] = ordinal`` bookkeeping is invisible
     here, because the probe would simply re-walk the occupied run and reach
@@ -763,7 +679,7 @@ def test_repeats_against_consecutive_occupied_suffixes_keep_every_table() -> Non
         f"every upstream table must survive: {CONSECUTIVE_SUFFIX_TABLE_COUNT} "
         f"tables were supplied but {len(out)} frames were returned. A count "
         f"below {CONSECUTIVE_SUFFIX_TABLE_COUNT} means at least one repeat "
-        f"displaced a sibling table's frame (CD-2)"
+        f"displaced a sibling table's frame"
     )
 
     # Assert -- the identity mapping of key order to upstream table order.
@@ -781,28 +697,26 @@ def test_repeats_against_consecutive_occupied_suffixes_keep_every_table() -> Non
 # Malformed envelopes — the seven exact ValueError messages
 # ---------------------------------------------------------------------------
 #
-# The five guards exercised here -- ``_extract_tables`` (L176),
-# ``_require_str`` (L229), ``_require_list`` (L261), the
-# non-string-headers branch (L142) and the row-not-a-sequence branch
-# (L341) -- are all reached exclusively through the public
-# ``normalize_result_sets``; no private helper is imported and no
-# production source file is touched.
+# The five guards exercised here -- ``_extract_tables``,
+# ``_require_str``, ``_require_list``, the non-string-headers branch and
+# the row-not-a-sequence branch -- are all reached exclusively through
+# the public ``normalize_result_sets``; no private helper is imported.
 #
 # Seven envelopes cover those five guards because two guards are reached
-# under two different keys: ``_require_list`` (L286) is applied to
-# ``headers`` and then to ``rowSet``, and ``_build_dataframe`` checks a
-# row's TYPE (L341) before its WIDTH (L346). The rendered field name and
-# type name are what distinguish the resulting messages.
+# under two different keys: ``_require_list`` is applied to ``headers``
+# and then to ``rowSet``, and ``_build_dataframe`` checks a row's TYPE
+# before its WIDTH. The rendered field name and type name are what
+# distinguish the resulting messages.
 #
-# Guard ORDER inside the per-table loop (L137-148) determines which
-# envelope trips which branch, so the shared fixture's shapes are
-# minimal but deliberate:
+# Guard ORDER inside the per-table loop determines which envelope trips
+# which branch, so the shared fixture's shapes are minimal but
+# deliberate:
 #
-#   L138  name    = _snake_case(_require_str(table, "name"))
-#   L139  headers = _require_list(table, "headers")
-#   L140  row_set = _require_list(table, "rowSet")
-#   L142  non-string headers check   (AFTER both _require_list calls)
-#   L147  _build_dataframe -> row TYPE check (L341) then WIDTH (L346)
+#   name    = _snake_case(_require_str(table, "name"))
+#   headers = _require_list(table, "headers")
+#   row_set = _require_list(table, "rowSet")
+#   non-string headers check   (AFTER both _require_list calls)
+#   _build_dataframe -> row TYPE check then WIDTH check
 #
 # Because ``pytest.raises(match=...)`` runs a ``re.search``, every
 # pattern below is wrapped in ``re.escape``: the messages contain ``'``,
@@ -857,12 +771,11 @@ def test_malformed_envelope_raises_valueerror_with_exact_message(
     """Each malformed envelope raises ``ValueError`` carrying its verbatim message.
 
     The seven expected strings in :data:`EXPECTED_MESSAGES` are the
-    production f-strings rendered by hand, each annotated with its source
-    line. ``re.escape`` keeps the regex literal so the punctuation in the
-    messages cannot silently relax the pattern. The error class is pinned
-    too: a non-dict payload raises ``TypeError`` at L117-120, so
-    ``ValueError`` here confirms the DATA-error path rather than the
-    programmer-error path.
+    messages each guard renders for its envelope. ``re.escape`` keeps the
+    regex literal so the punctuation in the messages cannot silently
+    relax the pattern. The error class is pinned too: a non-dict payload
+    raises ``TypeError``, so ``ValueError`` here confirms the DATA-error
+    path rather than the programmer-error path.
 
     Mutations detected: deleting or loosening any of these validation
     guards, and any drift in the operator-facing message text such as
@@ -897,8 +810,8 @@ def test_row_narrower_than_headers_reports_index_count_and_declared_width(
 ) -> None:
     """A two-value row against three declared headers raises the complete verbatim message.
 
-    Hand-derived from L347-350 with the fixture's own numbers: row index
-    ``0``, ``len(row) == 2``, and ``expected_width == len(headers) == 3``.
+    Hand-derived from the fixture's own numbers: row index ``0``,
+    ``len(row) == 2``, and ``expected_width == len(headers) == 3``.
     Full-string equality is asserted, so every component of the message is
     pinned rather than merely its presence.
 

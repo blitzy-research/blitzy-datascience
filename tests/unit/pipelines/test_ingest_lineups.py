@@ -88,16 +88,13 @@ _EXPECTED_KEY = f"{_ENDPOINT_LABEL}:{_SEASON}"
 # ---------------------------------------------------------------------------
 # Hand-derived EXPECTED values
 #
-# Every constant below is computed BY HAND from the ``sample_single_table_payload``
-# and ``sample_empty_payload`` fixtures in :mod:`tests.conftest` together with
-# this pipeline's INTENDED semantics — never captured from a run. Snapshot
-# assertions are not acceptable even when they pass, so the arithmetic behind
-# each number is spelled out in full here and a reviewer can verify it from the
-# fixture alone WITHOUT executing ``ingest_lineups.run``.
+# Every constant below follows from the ``sample_single_table_payload`` and
+# ``sample_empty_payload`` fixtures in :mod:`tests.conftest` together with this
+# pipeline's INTENDED semantics, and the arithmetic behind each number is
+# spelled out beside it.
 #
 # These are EXPECTED (output) values and are deliberately kept separate from the
-# fixture INPUT values, which remain owned by ``tests/conftest.py``. That
-# separation is what makes the derivation auditable.
+# fixture INPUT values, which remain owned by ``tests/conftest.py``.
 # ---------------------------------------------------------------------------
 
 #: Rows the writer must receive on the happy path.
@@ -166,11 +163,9 @@ EXPECTED_EMPTY_COLUMNS = [
 #: Label set every ``pipeline_rows_written_total`` increment must carry.
 #:
 #: The ``{"pipeline": "ingest_<domain>", "artifact": "<csv_name>.csv"}``
-#: convention is repository-wide — all five pipelines emit it and the games,
-#: players, schedule and teams suites already assert it in this exact shape —
-#: so it is a published observability contract, not a captured snapshot. Built
-#: from :data:`config.CSV_LINEUPS` so renaming the artifact stays a
-#: single-point edit.
+#: convention is repository-wide — all five pipelines emit it — so it is a
+#: published observability contract. Built from :data:`config.CSV_LINEUPS` so
+#: renaming the artifact stays a single-point edit.
 EXPECTED_ROW_COUNT_LABELS = {
     "pipeline": "ingest_lineups",
     "artifact": f"{config.CSV_LINEUPS}.csv",
@@ -418,11 +413,8 @@ def test_run_writes_exact_row_count_and_metric_value_for_lineups(
     The row count and the counter value are asserted as exact integers rather
     than as presence or positivity, because "a write happened" and "the count
     is above zero" cannot distinguish the correct quantity from a wrong one.
-    Test 1 already pins that a single ``lineups`` artifact is written for the
-    expected season and that the counter fires exactly once; what it cannot see
-    is HOW MANY rows travelled and WHAT quantity was reported. The
-    distinct-``PLAYER_ID`` count is asserted alongside the row count: the pair
-    ``3 rows over 3 distinct identifiers`` is what pins row-for-row
+    The distinct-``PLAYER_ID`` count is asserted alongside the row count: the
+    pair ``3 rows over 3 distinct identifiers`` is what pins row-for-row
     conservation, since either number alone tolerates a swap.
 
     Mutations detected
@@ -437,7 +429,7 @@ def test_run_writes_exact_row_count_and_metric_value_for_lineups(
     * Emitting the wrong quantity into ``pipeline_rows_written_total`` — a
       constant ``1``, a column count, or a distinct-key count instead of a row
       count — fails the ``n=`` assertion even though the counter still fires
-      exactly once, which is all Test 1 checks.
+      exactly once.
     * Renaming the counter empties the filtered call list, so the call-count
       assertion fails first. Changing the label KEYS or VALUES while keeping
       the counter name is what the label assertion catches — the failure mode
@@ -448,13 +440,12 @@ def test_run_writes_exact_row_count_and_metric_value_for_lineups(
       header, fails the ordered column-list assertion. That helper is CORRECT
       as written — a ``SEASON_ID`` value such as ``"22025"`` is a different
       quantity from a ``"2025-26"`` season string, so matching only
-      ``c.lower() == "season"`` is deliberate — hence this assertion guards
-      against a well-intentioned regression, it does not describe a defect.
+      ``c.lower() == "season"`` is deliberate.
     """
     # --- Arrange -------------------------------------------------------
-    # ``recording_writer`` takes NO positional argument: its only factory
-    # parameter is ``raise_on``, and the spy is already rooted at this test's
-    # ``tmp_path / "output"`` directory, so isolation is automatic.
+    # The ``recording_writer`` fixture prebinds ``tmp_path / "output"``, so
+    # this call needs no output-directory argument and isolation is automatic.
+    # Its optional ``raise_on`` parameter is omitted here.
     client = recording_client(responses={_ENDPOINT_LABEL: sample_single_table_payload})
     writer = recording_writer()
     checkpoint = recording_checkpoint()
@@ -507,7 +498,7 @@ def test_run_writes_exact_row_count_and_metric_value_for_lineups(
     )
 
     # --- Assert: row-for-row conservation of the three fixture records --
-    # Read-only inspection of the snapshot the spy captured at write time. The
+    # Read-only inspection of the copy the spy recorded at write time. The
     # frame is never mutated here, so no pandas SettingWithCopyWarning or
     # PerformanceWarning can be provoked under ``filterwarnings = error``.
     df = write["df"]
@@ -545,18 +536,14 @@ def test_run_writes_header_only_artifact_and_marks_checkpoint_for_empty_rowset(
     :func:`utils.schema_normalizer.normalize_result_sets` returns, and
     ``_select_primary_df`` selects it. The pipeline must NOT treat that as
     "nothing to do": the zero flows all the way through to the metric rather
-    than short-circuiting at any of the three stages. Operators depend on that,
-    because a season whose lineup aggregates are momentarily unavailable
-    upstream must still refresh the artifact instead of leaving yesterday's rows
-    on disk looking current.
+    than short-circuiting at any of the three stages, so a season whose lineup
+    aggregates are momentarily unavailable upstream still refreshes the
+    artifact instead of leaving yesterday's rows on disk looking current.
 
-    This is also the empty-input analogue of an aggregation zero-divisor
-    boundary. No arithmetic division, ``mean``, ``groupby`` aggregation or
-    ``agg`` calculation exists in the production tree that could produce a
-    zero-lineup denominator — the only ``/`` operators there compose
-    :class:`pathlib.Path` values — so the degenerate-count case is the faithful
-    stand-in: the place where a count reaching zero really does change
-    behavior.
+    The production tree performs no arithmetic division, ``mean``, ``groupby``
+    or ``agg`` aggregation, so this degenerate-count case is the faithful
+    stand-in for a zero-divisor boundary: the place where a count reaching zero
+    really does change behavior.
 
     Mutations detected
     ------------------
@@ -665,22 +652,20 @@ def test_rule5_write_failure_propagates_and_leaves_checkpoint_unmarked(
 
     Rule 5 requires that ``mark_completed`` run only *downstream of a
     successful write*, so a failing write must leave the checkpoint entirely
-    unmarked and the next run must retry the same key. Test 3 pins the ordering
-    on the SUCCESS path only — both calls happen there, so it cannot tell
-    "mark after write" apart from "mark regardless of write". This negative
-    case is what separates the two. ``RecordingWriter(raise_on=...)`` raises
+    unmarked and the next run must retry the same key. A success-path ordering
+    check cannot tell "mark after write" apart from "mark regardless of write";
+    only this negative case can. ``RecordingWriter(raise_on=...)`` raises
     ``RuntimeError("synthetic write failure for 'lineups'")`` instead of
     recording, and because Rule 6 fail-safe wrapping is scoped exclusively to
-    :mod:`pipelines.ingest_games` — this module's own docstring and the
-    pipeline's own docstring both say so — the lineups pipeline must let that
-    exception escape rather than absorb it.
+    :mod:`pipelines.ingest_games`, the lineups pipeline must let that exception
+    escape rather than absorb it.
 
     Mutations detected
     ------------------
     * Moving ``checkpoint.mark_completed`` ABOVE ``writer.write``: the pipeline
       would checkpoint work that was never persisted, and every resumed run
-      would then skip that season forever while producing no artifact at all —
-      the worst possible silent failure for this system.
+      would then skip that season forever while producing no artifact at
+      all.
     * Swallowing the write failure and returning normally (Rule 6's per-entity
       guard misapplied to a single-shot pipeline — catching the exception and
       returning before the counter and the checkpoint mark): the caller would
@@ -700,8 +685,7 @@ def test_rule5_write_failure_propagates_and_leaves_checkpoint_unmarked(
     """
     # --- Arrange -------------------------------------------------------
     # ``raise_on`` is passed by keyword so the armed artifact is explicit at the
-    # call site and cannot be misbound should the factory ever grow a second
-    # parameter. It must equal the artifact name the pipeline writes, otherwise
+    # call site. It must equal the artifact name the pipeline writes, otherwise
     # the write succeeds and this negative test silently becomes a no-op.
     client = recording_client(responses={_ENDPOINT_LABEL: sample_single_table_payload})
     writer = recording_writer(raise_on=config.CSV_LINEUPS)

@@ -3,11 +3,10 @@
 What this module pins
 ---------------------
 The Games pipeline is the only pipeline that *aggregates*: it accumulates
-one DataFrame per game into an in-memory buffer and re-writes the **full**
-concatenated artifact after every game (``pipelines/ingest_games.py``
-lines 794-799), then increments ``pipeline_rows_written_total`` with the
-**per-game** row count -- never the cumulative frame length (lines
-802-811). This module asserts that arithmetic exactly:
+one DataFrame per game into an in-memory buffer, re-writes the **full**
+concatenated artifact after every game, then increments
+``pipeline_rows_written_total`` with the **per-game** row count -- never
+the cumulative frame length. This module asserts that arithmetic exactly:
 
 * the ordered cumulative ``games.csv`` write sizes ``[2, 5, 7]`` and
   ``play_by_play.csv`` write sizes ``[4, 5, 8]``, plus the interleaved
@@ -67,48 +66,23 @@ prior-session buffer loaders are replaced with recording spies (see
 guard is a pure performance regression that leaves every write, mark,
 metric and log record unchanged.
 
-Why a separate sibling module
------------------------------
-``tests/unit/pipelines/test_ingest_games.py`` owns the Rule 6 canary
-suite and checks the aggregation with shapes that constrain direction and
-sign rather than exact values (see below). This module carries the
-value-exact assertions instead, so each concern stays reviewable on its
-own. A sibling module is collected automatically because ``pytest.ini``
-sets ``python_files = test_*.py``.
-
-The assertion shapes this module strengthens
---------------------------------------------
-The happy-path test in ``test_ingest_games.py`` checks the aggregation
-with two shapes that a plausible bug can satisfy:
-
-1. a **monotonicity** check on the cumulative write sizes,
-   ``assert w["rows"] >= prev_games_rows``; and
-2. a **presence-and-positivity** check on the row counter,
-   ``assert "n" in c.kwargs`` followed by ``assert c.kwargs["n"] > 0``.
-
-Neither shape can separate the correct implementation from a mutation
-that replaces the cumulative ``pd.concat(buffer, ...)`` with "write only
-the latest frame", nor from one that emits ``len(combined_games)``
-instead of ``len(bs_df)``, when every game contributes the same number
-of rows: the fixtures that test uses deliver **equal** per-game counts
-(2 box-score and 3 play-by-play rows per game), so the latest-frame
-sequence is flat and still non-decreasing, and every positive ``n=``
-looks alike whether it is a per-game delta or a running total. This
-module asserts the sequences themselves, in the aggregation path.
-
 Why the per-game row counts are deliberately unequal
 ----------------------------------------------------
 The canonical mini-season fixture contributes **2 / 3 / 2** box-score
 rows and **4 / 1 / 3** play-by-play rows. That asymmetry is what makes
-the two mutations above observable: "write only the latest frame" yields
+two plausible mutations observable: replacing the cumulative
+``pd.concat(buffer, ...)`` with "write only the latest frame" yields
 ``[2, 3, 2]`` / ``[4, 1, 3]`` rather than the running totals
-``[2, 5, 7]`` / ``[4, 5, 8]``, and emitting cumulative lengths yields
-``[2, 4, 5, 5, 7, 8]`` rather than the per-game ``[2, 4, 3, 1, 2, 3]``.
-Because consecutive games contribute different counts, every running
-total is strictly larger than the one before it, so each mutated sequence
-diverges from the correct one from the second write onward -- and the
-latest-frame sequences additionally decrease, which no cumulative
-sequence can. The counts must not be normalised, equalised, or reordered.
+``[2, 5, 7]`` / ``[4, 5, 8]``, and emitting ``len(combined_games)``
+instead of ``len(bs_df)`` yields ``[2, 4, 5, 5, 7, 8]`` rather than the
+per-game ``[2, 4, 3, 1, 2, 3]``. Because consecutive games contribute
+different counts, every running total is strictly larger than the one
+before it, so each mutated sequence diverges from the correct one from
+the second write onward -- and the latest-frame sequences additionally
+decrease, which no cumulative sequence can. With equal per-game counts
+both mutations would satisfy a monotonicity check on the write sizes and
+a positivity check on the counter, which is why the counts must not be
+normalised, equalised, or reordered.
 
 The hand-derived arithmetic, in full
 ------------------------------------
@@ -135,24 +109,12 @@ G1 30+28=58 ; G2 25+31+22=78 ; G3 35+18=53 ; 58+78+53=189. By player:
 Jokic 30+25=55 ; Doncic 28+35=63 ; Tatum 31 ; Curry 22+18=40 ;
 55+63+31+40=189.
 
-Hand-derived, never captured
-----------------------------
-Every expected value above follows from the fixture rows alone and was
-computed on paper before this module ran. Nothing here is a snapshot of
-observed output: no ``pandas.testing.assert_frame_equal`` against a
-produced frame, no golden CSV, no record-then-compare helper. The
-``EXPECTED_*`` constants below carry their arithmetic in an adjacent
-comment so a reviewer can verify every number without leaving the file.
-Expected values are kept strictly separate from the fixture *input*
-values, which live in ``tests/conftest.py`` and are consumed as-is.
-
-Tier and markers
-----------------
-This module carries **no** pytest marker, so it runs on the default
-offline tier. ``pytest.ini`` registers exactly two markers
-(``integration``, ``invariant``) and ``--strict-markers`` turns any
-third into a hard collection error. Every collaborator is a spy, so
-there is no network access, no sleep, and no wall-clock read.
+Every expected value above follows from the fixture rows alone, and each
+``EXPECTED_*`` constant below carries its arithmetic in an adjacent
+comment. Expected values are kept strictly separate from the fixture
+*input* values, which live in ``tests/conftest.py`` and are consumed
+as-is. Every collaborator is a spy, so there is no network access, no
+sleep and no wall-clock read.
 
 Monkey-patch target
 -------------------
@@ -169,37 +131,26 @@ Patching ``endpoints.schedule.enumerate_game_ids`` would have no effect.
 Because enumeration is patched out, this module is independent of the
 canonical-``GAME_ID`` behaviour of ``endpoints/schedule.py``.
 
-Rule 6 is deliberately NOT re-tested here
------------------------------------------
-Per-game failure isolation is already covered by
-``test_ingest_games.py::TestRule6FailSafe``. This module adds no new
+Rule 6 scope
+------------
+Per-game failure isolation is owned by
+``test_ingest_games.py::TestRule6FailSafe``; this module adds no new
 Rule 6 error case. The boundary, schema-drift and continuation tests do
-additionally assert that
-``games_failed_total`` was **never** incremented: that is negative-space
-evidence, alongside their recorded write, row-increment and
+assert that ``games_failed_total`` was **never** incremented --
+negative-space evidence, alongside their write, row-increment and
 checkpoint-mark assertions, that a degenerate-but-valid payload flowed
 through the happy path rather than being swallowed by the fail-safe
 handler.
 
-There is no literal "zero-game divisor" in this codebase
---------------------------------------------------------
-Stated plainly rather than papered over: no arithmetic division, no
-``mean``, no ``groupby`` aggregation and no ``agg`` call site exists
-anywhere in ``api/``, ``endpoints/``, ``pipelines/``, ``storage/``,
-``utils/``, ``config.py``, or ``run.py``, so no calculation there can
-produce a zero-game denominator. (The ``/`` operator does appear in
-production, but only to compose :class:`pathlib.Path` values.) The only
-aggregation primitives are the two ``pd.concat`` calls this module
-targets. So there is no divisor to drive to zero, and none is invented
-here. The requirement is honoured through faithful analogues, of which
-this module supplies five: the zero-enumerated-games short circuit (the
-loop body never executes), cumulative row-count conservation (exactly 7
-and 8), per-game versus cumulative counter semantics (the
-``[2, 4, 3, 1, 2, 3]`` sequence), disjoint-column concatenation with null
-fill and ``float64`` upcast (the ``PTS``/``REB`` union), and
-concatenation in which one contributing frame has zero rows (the
-``object``-dtype asymmetry). The remaining analogue -- an empty ``rowSet``
-in the single-shot pipelines -- belongs to their own test modules.
+The pipelines perform no arithmetic division, ``mean``, ``groupby`` or
+``agg`` aggregation, so no calculation can produce a zero-game
+denominator; the two ``pd.concat`` calls this module targets are the only
+aggregation primitives, and their boundary cases are the
+zero-enumerated-games short circuit (the loop body never executes),
+row-count conservation (exactly 7 and 8), per-game versus cumulative
+counter semantics, disjoint-column concatenation with null fill and
+``float64`` upcast, and concatenation in which one contributing frame has
+zero rows.
 """
 
 from __future__ import annotations
@@ -231,8 +182,7 @@ _BOXSCORE_ENDPOINT = "boxscoretraditionalv2"
 #: Endpoint name for the play-by-play endpoint.
 _PLAYBYPLAY_ENDPOINT = "playbyplayv2"
 
-#: Verbatim per-artifact row counter emitted after every successful game
-#: (``pipelines/ingest_games.py`` lines 802-811).
+#: Verbatim per-artifact row counter emitted after every successful game.
 _ROWS_WRITTEN_COUNTER = "pipeline_rows_written_total"
 
 #: Verbatim Rule 6 failure counter (``pipelines/ingest_games.py`` line
@@ -244,18 +194,18 @@ _GAMES_FAILED_COUNTER = "games_failed_total"
 #: (``pipeline``/``artifact``, not ``domain``/``file``) are the documented
 #: operator contract. It does not apply to ``games_failed_total``, which is
 #: emitted with a single-key label set instead -- ``{"reason": <exception
-#: class name>}`` (``pipelines/ingest_games.py`` line 851).
+#: class name>}``.
 _PIPELINE_LABEL = "ingest_games"
 
 #: Log-message prefix of the per-game completion event emitted once per
-#: successfully processed game (``pipelines/ingest_games.py`` line 820).
+#: successfully processed game.
 _GAME_COMPLETE_PREFIX = "pipeline.games.game_complete"
 
 #: The COMPLETE, verbatim format string of that per-game event. The
-#: production call site splits the literal across two source lines
-#: (``pipelines/ingest_games.py`` lines 820-825), which the interpreter
-#: concatenates into exactly the single string reproduced here -- one space
-#: between ``game_id=%s`` and ``box_rows=%d``.
+#: production call site splits the literal across two adjacent string
+#: constants, which the interpreter concatenates into exactly the single
+#: string reproduced here -- one space between ``game_id=%s`` and
+#: ``box_rows=%d``.
 #:
 #: Comparing the format string itself, and not merely its interpolated
 #: arguments, is what pins the operator-facing FIELD NAMES and the
@@ -268,9 +218,9 @@ _GAME_COMPLETE_FORMAT = (
 )
 
 #: Log-message prefix shared by BOTH terminal events -- the skip variant
-#: (line 736) and the processed/failed variant (line 854). Filtering on the
-#: shared prefix is what lets a test assert *which* branch terminated the
-#: run rather than merely that some completion event was emitted.
+#: and the processed/failed variant. Filtering on the shared prefix is what
+#: lets a test assert *which* branch terminated the run rather than merely
+#: that some completion event was emitted.
 _PIPELINE_COMPLETE_PREFIX = "pipeline.complete"
 
 
@@ -309,17 +259,16 @@ EXPECTED_GAMES_INCREMENTS = [2, 3, 2]
 EXPECTED_PBP_INCREMENTS = [4, 1, 3]
 
 #: The COMPLETE label mapping every games-CSV row-written increment must
-#: carry, transcribed from ``pipelines/ingest_games.py`` lines 802-806. The
-#: label NAMES are ``pipeline``/``artifact`` (not ``domain``/``file``) and
-#: the artifact value is the CSV filename, so it is built from
-#: ``config.CSV_GAMES`` rather than a duplicated literal.
+#: carry. The label NAMES are ``pipeline``/``artifact`` (not
+#: ``domain``/``file``) and the artifact value is the CSV filename, so it is
+#: built from ``config.CSV_GAMES`` rather than a duplicated literal.
 EXPECTED_GAMES_LABELS = {
     "pipeline": _PIPELINE_LABEL,
     "artifact": f"{config.CSV_GAMES}.csv",
 }
 
 #: The COMPLETE label mapping every play-by-play row-written increment must
-#: carry (``pipelines/ingest_games.py`` lines 808-811).
+#: carry.
 EXPECTED_PBP_LABELS = {
     "pipeline": _PIPELINE_LABEL,
     "artifact": f"{config.CSV_PLAY_BY_PLAY}.csv",
@@ -620,7 +569,7 @@ def _writes_named(writer: Any, name: str) -> List[Dict[str, Any]]:
 
 
 def _last_frame_named(writer: Any, name: str) -> pd.DataFrame:
-    """Return the DataFrame snapshot of the LAST write for one artifact.
+    """Return the recorded copy of the LAST write for one artifact.
 
     ``RecordingWriter`` records ``df.copy()`` at write time, so the frame
     returned here is the value the pipeline actually handed to the writer
@@ -726,9 +675,8 @@ def _boxscore_payload(
     It exists so the schema-drift scenarios can declare DIFFERENT headers
     per game -- something the shared mini-season fixtures deliberately do
     not do, because their single common schema is what keeps their
-    cumulative arithmetic simple. Building these envelopes locally honours
-    the AAP's rule that a single-module concern stays out of the shared
-    fixture surface.
+    cumulative arithmetic simple. Building them locally keeps a
+    single-module concern out of the shared fixture surface.
 
     The single ``resultSets`` entry is named ``"PlayerStats"`` to match the
     mini-season envelopes, so ``_select_primary_df`` picks it as the
@@ -800,9 +748,8 @@ class _BufferLoaderSpy:
     """Handwritten recording stand-in for a prior-session buffer loader.
 
     ``ingest_games.run`` seeds its two in-memory buffers by calling
-    ``_load_existing_games`` and ``_load_existing_pbp`` (``pipelines/
-    ingest_games.py`` lines 759-765) -- and it does so *after* the
-    ``if not pending:`` short circuit at line 735. Each helper performs a
+    ``_load_existing_games`` and ``_load_existing_pbp`` -- and it does so
+    *after* the ``if not pending:`` short circuit. Each helper performs a
     ``Path.is_file()`` probe and, when the artifact exists, a full
     :func:`pandas.read_csv` of a file that grows to a whole season of box
     scores and play-by-play events. On an all-checkpointed run that work is
@@ -812,8 +759,8 @@ class _BufferLoaderSpy:
     is inverted: with an empty pending list the loop body does not execute
     either way, so writes, marks, metrics and even the terminal log event
     stay identical while every run silently pays for two file probes and
-    two potentially large CSV parses. Recording the invocations is
-    therefore the only way to pin the guard's PERFORMANCE contract.
+    two potentially large CSV parses. Recording the invocations is what
+    pins the guard's PERFORMANCE contract.
 
     Returning ``[]`` reproduces the real behaviour under
     ``RecordingWriter`` faithfully: that spy creates its ``output_dir`` but
@@ -928,28 +875,25 @@ class _MiniSeasonClient:
 
     A self-contained, module-local stand-in for
     :class:`api.nba_client.NBAClient`. It mirrors the production
-    ``get(endpoint, params) -> dict`` signature verbatim (see
-    ``api/nba_client.py`` line 368) and resolves its response by
-    ``GameID``, which is what lets the mini-season return a *different*
-    box score per game -- something an endpoint-keyed spy cannot express.
+    ``get(endpoint, params) -> dict`` signature verbatim and resolves its
+    response by ``GameID``, which is what lets the mini-season return a
+    *different* box score per game -- something an endpoint-keyed spy
+    cannot express.
 
     It records call tuples on :attr:`calls` using the same
     ``(endpoint, params)`` shape as the shared ``RecordingClient`` spy, so
     assertions over ``client.calls`` stay semantically compatible with
     every other pipeline test in the suite. Owning that recording locally
     -- rather than deriving from the shared spy -- keeps this
-    single-module concern out of the shared fixture surface entirely; it
-    is the same standalone shape ``_SelectiveFailureClient`` uses in
-    ``test_ingest_games.py``.
+    single-module concern out of the shared fixture surface.
 
     Being *handwritten* rather than a :class:`~unittest.mock.MagicMock` is
     equally deliberate: a drift in the production client's ``get``
     signature surfaces here as a real ``TypeError`` at call time instead
     of being silently absorbed by attribute-access magic.
 
-    Both endpoint helpers set ``params["GameID"] = str(game_id)``
-    (``endpoints/games.py`` lines 251 and 399), so one routing key serves
-    the box-score and play-by-play calls alike.
+    Both endpoint helpers set ``params["GameID"] = str(game_id)``, so one
+    routing key serves the box-score and play-by-play calls alike.
 
     An unmapped endpoint or an unmapped ``GameID`` raises
     :class:`AssertionError` rather than falling back to a synthetic
@@ -982,7 +926,7 @@ class _MiniSeasonClient:
 
     def get(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Record the call on :attr:`calls`, then route by endpoint and GameID."""
-        # Snapshot the parameter map defensively before routing, so the
+        # Copy the parameter map defensively before routing, so the
         # recorded tuple reflects the arguments exactly as they were
         # passed even if the caller mutates its dict afterwards.
         self.calls.append((str(endpoint), dict(params or {})))
@@ -1179,15 +1123,10 @@ def test_row_written_counter_emits_per_game_deltas_in_emission_order(
     # --- Assert: the per-game log is an independent witness ------------
     # ``pipeline.games.game_complete game_id=%s box_rows=%d pbp_rows=%d``
     # carries the same per-game counts, so the log and the counter must
-    # agree: (G1, 2, 4), (G2, 3, 1), (G3, 2, 3).
-    #
-    # The comparison is against the COMPLETE ``(format string, args)``
-    # record, not the arguments alone. The format string is the operator
-    # contract -- it names the fields a log-parsing rule keys on -- so
-    # renaming ``box_rows``, dropping ``pbp_rows``, swapping ``%d`` for
-    # ``%s``, or appending trailing content after the same prefix must all
-    # fail here even though each leaves the three positional arguments
-    # byte-identical.
+    # agree: (G1, 2, 4), (G2, 3, 1), (G3, 2, 3). The comparison is against
+    # the COMPLETE ``(format string, args)`` record, so a renamed field, a
+    # dropped field or a changed conversion kind fails here even though the
+    # three positional arguments stay byte-identical.
     expected_game_events = [
         (_GAME_COMPLETE_FORMAT, (gid, box_rows, pbp_rows))
         for gid, (box_rows, pbp_rows) in zip(
@@ -1225,7 +1164,7 @@ def test_final_combined_frame_conserves_rows_points_and_column_order(
     total, and the [2, 3, 2] per-``GAME_ID`` distribution simultaneously.
     Inserting ``game_id`` when ``GAME_ID`` is already present, or inserting
     ``season`` at the wrong index, shifts the exact ordered column list.
-    Every assertion reads the recorded snapshot without mutating it, so no
+    Every assertion reads the recorded copy without mutating it, so no
     pandas warning can be provoked under ``filterwarnings = error``.
     """
     # --- Arrange -------------------------------------------------------
@@ -1390,12 +1329,10 @@ def test_zero_enumerated_games_short_circuits_before_any_aggregation(
 ) -> None:
     """Zero enumerated games produces zero writes, marks, and increments.
 
-    This is the closest structural analogue this codebase has to a
-    "zero-game divisor": the aggregation loop body never executes, so
-    every downstream quantity must be exactly empty rather than merely
-    small. The pending probe still fires -- that is how the skip is
-    decided -- and it records an EMPTY key tuple, which only happens when
-    enumeration itself returned nothing.
+    The aggregation loop body never executes, so every downstream quantity
+    must be exactly empty rather than merely small. The pending probe still
+    fires -- that is how the skip is decided -- and it records an EMPTY key
+    tuple, which only happens when enumeration itself returned nothing.
 
     Mutations detected:
 
@@ -1405,14 +1342,12 @@ def test_zero_enumerated_games_short_circuits_before_any_aggregation(
     * **Returning before the consult** (an "optimisation" that skips
       ``get_pending`` when enumeration is empty) -- same assertion.
     * **Removing the ``if not pending: return`` guard** -- caught by the
-      terminal-log-event assertion and *only* by it. This is a verified
-      finding rather than an assumption: with an empty pending list the
-      loop body does not execute either way, so writes, marks, and metric
-      increments are identically empty in both the guarded and unguarded
-      pipeline. The one observable difference is which terminal event is
-      logged -- ``status=skipped reason=all_checkpointed`` versus
-      ``processed=0 failed=0`` -- so the spy-only assertions below would
-      pass against the mutant without it.
+      terminal-log-event assertion and *only* by it: with an empty pending
+      list the loop body does not execute either way, so writes, marks and
+      metric increments are identically empty in both the guarded and
+      unguarded pipeline. The one observable difference is which terminal
+      event is logged -- ``status=skipped reason=all_checkpointed`` versus
+      ``processed=0 failed=0``.
     * **Hoisting either buffer loader ABOVE the guard** -- a PERFORMANCE
       regression that every other assertion in this test survives. Both
       helpers stat the artifact and, when it exists, parse a whole season
@@ -1421,10 +1356,6 @@ def test_zero_enumerated_games_short_circuits_before_any_aggregation(
       re-running a completed season -- pay for two file probes and two
       full CSV parses to produce nothing. Only instrumenting the loaders
       detects it, which is what the two loader-spy assertions below do.
-      Their non-vacuity is established by
-      ``test_buffer_loaders_run_once_each_after_the_pending_guard``, which
-      proves the very same patch seam records invocations when games ARE
-      pending.
     * **Emitting ANY counter on the skip path** -- a stray
       ``games_failed_total``, a new skip counter, or a row-written
       increment whose counter NAME was mutated. A name-filtered assertion
@@ -2065,7 +1996,7 @@ def test_heterogeneous_box_score_schemas_concat_into_the_outer_column_union(
 # contributor that follows: the empty frame stays in the buffer, and the
 # next game's rows must appear in the cumulative artifact alongside it.
 #
-# It also pins the dtype asymmetry AAP §0.4.2.4 names: an all-``object``
+# It also pins the dtype asymmetry of that continuation: an all-``object``
 # zero-row contributor keeps the union ``object`` instead of letting the
 # non-empty frame's ``int64`` win -- the one observable trace that the empty
 # frame is still in the buffer at all.

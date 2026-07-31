@@ -33,26 +33,21 @@ delays and risking upstream abuse protections. Narrowing the condition with
 propagates on the first attempt. The headline mutation is widening the predicate
 back to every ``HTTPError``: each permanent 404 would then consume
 ``config.RETRY_ATTEMPTS`` attempts instead of one. Each test below names the
-single-statement mutation it detects, because mutation resistance -- not a
-coverage percentage -- is the acceptance bar; no coverage instrument ships with
-this project and none may be added.
+single-statement mutation it detects.
 
-Derivation, tier and isolation
-------------------------------
-Expected values are derived from the STRUCTURE of ``api/nba_client.py``, never
-captured from a run: the ten booleans from the predicate body; the
-exactly-one-attempt count from ``retry_if_exception`` plus ``reraise=True`` on
-the ``_request`` decorator; the reason labels from the closed taxonomy in
-``get()``; and the ``1.0`` failure count from that ``inc`` sitting inside
-``get()``'s ``except RequestException`` block -- once per *invocation*, never
-once per *attempt*.
+Derivation and isolation
+------------------------
+Expected values follow from the STRUCTURE of ``api/nba_client.py``: the ten
+booleans from the predicate body; the exactly-one-attempt count from
+``retry_if_exception`` plus ``reraise=True`` on the ``_request`` decorator; the
+reason labels from the closed taxonomy in ``get()``; and the ``1.0`` failure
+count from that ``inc`` sitting inside ``get()``'s ``except RequestException``
+block -- once per *invocation*, never once per *attempt*.
 
-No test carries a pytest marker, so all run on the default offline tier, and
-none performs network I/O: every request is served by a ``MagicMock`` installed
-on the client's session through ``monkeypatch``. The doubles are module-local
-rather than imported from a neighbouring test module (which would couple two
-modules) or added to the shared ``tests/conftest.py``. Exception classes come
-from the ``api.nba_client`` namespace rather than the HTTP library directly,
+No test performs network I/O: every request is served by a ``MagicMock``
+installed on the client's session through ``monkeypatch``. Exception classes
+come from the ``api.nba_client`` namespace rather than the HTTP library
+directly,
 honouring the ``tests/conftest.py`` do-not list ("Do NOT import
 :mod:`requests`" -- Rule 1, Single HTTP Client); they are the *same class
 objects*, so production ``isinstance`` checks behave identically. The shared
@@ -88,7 +83,7 @@ from utils import metrics
 
 
 # ---------------------------------------------------------------------------
-# Module constants -- each read from the production source, not from a run
+# Module constants
 # ---------------------------------------------------------------------------
 
 # Endpoint label reused by every test. Endpoint names are call-site arguments
@@ -313,12 +308,9 @@ def client(mock_rate_limiter: MagicMock, tmp_log_dir: Path) -> NBAClient:
     Injecting a per-instance ``logger=`` would NOT be sufficient: the tenacity
     ``before_sleep`` callback ``api.nba_client._retry_log_before_sleep`` is a
     module-level function with no access to ``self``, so it calls
-    ``get_logger("nba_client")`` itself and would resolve the production sink
-    regardless of what this instance holds. Redirecting the configured
-    destination is therefore the only fix that covers both writers.
-    ``test_retry_logging_is_confined_to_the_temporary_log_file`` pins this, so
-    dropping the dependency fails the module rather than silently resuming the
-    pollution.
+    ``get_logger("nba_client")`` itself and resolves the configured sink
+    regardless of what this instance holds. Redirecting that configured
+    destination covers both writers.
     """
     return NBAClient(rate_limiter=mock_rate_limiter)
 
@@ -398,7 +390,7 @@ def test_is_transient_classifies_every_exception_shape_exactly(
     # Assert -- identity, not truthiness, so a truthy non-bool is caught too.
     assert result is expected, (
         f"_is_transient({type(exc).__name__}, status={observed_status!r}) "
-        f"expected {expected!r} per api/nba_client.py lines 231-247, "
+        f"expected {expected!r} per the branch table of _is_transient, "
         f"got {result!r}"
     )
     assert type(result) is bool, (
@@ -510,8 +502,8 @@ def test_status_499_is_not_retried_through_client_get(
     )
     assert _failure_count(REASON_HTTP_4XX_NON_429) == EXPECTED_COUNTER_HIT, (
         f"status {STATUS_LAST_NON_5XX} must be labelled "
-        f"{REASON_HTTP_4XX_NON_429!r} because ``499 >= 500`` is False in the "
-        f"classifier at api/nba_client.py line 500; got "
+        f"{REASON_HTTP_4XX_NON_429!r} because ``499 >= 500`` is False in "
+        f"the reason taxonomy of NBAClient.get; got "
         f"{_failure_count(REASON_HTTP_4XX_NON_429)!r}"
     )
     assert _failure_count(REASON_HTTP_5XX) == EXPECTED_COUNTER_MISS, (
