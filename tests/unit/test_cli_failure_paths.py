@@ -164,6 +164,64 @@ READY_PROBE_RESULT: Dict[str, Any] = {
     "checks": {"output_dir_writable": {"status": "ok", "detail": "injected by test"}},
 }
 
+# ---------------------------------------------------------------------------
+# Constants for Section F — the failure-disclosure CHARACTERIZATION.
+#
+# Every literal below is DERIVED from ``run.py`` and ``utils/logger.py``
+# and the derivation is written out beside it. None of them was obtained
+# by capturing output and pasting it back.
+# ---------------------------------------------------------------------------
+
+#: Header :mod:`traceback` writes before the first frame of a rendered
+#: stack. Its presence in a published record is the whole substance of
+#: the disclosure being characterised.
+TRACEBACK_HEADER: str = "Traceback (most recent call last)"
+
+#: Prefix :mod:`traceback` writes before each frame's ABSOLUTE source
+#: path. Counting it counts disclosed filesystem paths.
+TRACEBACK_FRAME_PREFIX: str = 'File "'
+
+#: Exactly ONE rendered stack reaches each sink per failed invocation.
+#: Derivation: every ``except Exception`` block in ``run.py`` calls
+#: ``log.exception`` exactly once, ``log.exception`` is
+#: ``log.error(..., exc_info=True)``, and the injected exception is
+#: raised bare — no ``from`` clause and no nested handler — so the
+#: formatter emits one stack with no "During handling of the above
+#: exception" or "The above exception was the direct cause" continuation.
+EXPECTED_TRACEBACK_HEADERS: int = 1
+
+#: Exactly TWO frames are disclosed. Derivation: the rendered stack spans
+#: the frames between the ``try`` that caught the exception and the
+#: ``raise``. That is the dispatch statement inside ``run.py`` plus the
+#: ``_run`` body of this module's own spy — one call, therefore two
+#: frames. One of them is ``run.py``'s absolute path; the other is this
+#: test module's.
+EXPECTED_TRACEBACK_FRAMES: int = 2
+
+#: Each ``log.exception`` call renders its format string once.
+EXPECTED_FAILURE_EVENT_OCCURRENCES: int = 1
+
+#: The injected message surfaces exactly once — on the stack's terminal
+#: ``<qualified class>: <message>`` line. The intermediate frame lines
+#: quote source text (``raise failure``), not the message, so no second
+#: occurrence exists.
+EXPECTED_INJECTED_MESSAGE_OCCURRENCES: int = 1
+
+#: (CLI subcommand, pipeline module key to break) for all SIX
+#: ``except Exception`` handlers in ``run.py`` — the five data
+#: subcommands plus the aggregate. ``all`` is driven by breaking
+#: ``schedule`` because that is the FIRST entry of
+#: :data:`EXPECTED_ALL_ORDER`, so the aggregate handler is reached on the
+#: first dispatch.
+FAILURE_HANDLER_TARGETS: tuple = (
+    ("players", "players"),
+    ("teams", "teams"),
+    ("games", "games"),
+    ("lineups", "lineups"),
+    ("schedule", "schedule"),
+    ("all", FIRST_ALL_PIPELINE),
+)
+
 #: CLI subcommand name -> the pipeline module whose ``run`` attribute
 #: must be patched. ``run.py`` performs ``from pipelines import
 #: ingest_<domain>`` and resolves ``.run`` at CALL time, so patching the
@@ -788,4 +846,171 @@ def test_ready_subcommand_exits_zero_and_echoes_the_body_when_ready(
     assert result.stderr == "", (
         f"`cli ready` must emit the probe body on stdout, not stderr; "
         f"stderr={result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Section F — CHARACTERIZATION of a KNOWN DEFECT in the failure handlers.
+#
+# * **This section documents behaviour that is WRONG, and asserts it on
+#   purpose.** It is the remedy the Agent Action Plan prescribes in
+#   §0.4.5 for a defect whose fix lies outside the authorised scope:
+#   "leave the source untouched and instead add a test documenting the
+#   current behavior with a comment naming the defect."
+#
+# * **The defect.** Each of the six ``except Exception`` blocks in
+#   ``run.py`` calls ``log.exception(...)``, which is
+#   ``log.error(..., exc_info=True)``. ``utils/logger.py::_configure``
+#   attaches BOTH a ``logging.StreamHandler(sys.stdout)`` AND a
+#   ``logging.handlers.RotatingFileHandler`` to the root logger at
+#   ``config.LOG_LEVEL`` (default ``INFO``), so that one ERROR record is
+#   rendered — traceback and all — into the operator's console AND into
+#   the durable log file. The rendered stack carries absolute filesystem
+#   paths and the exception's message. Classified CWE-209 (generation of
+#   error message containing sensitive information), CWE-497 (exposure of
+#   system data to an unauthorised control sphere) and CWE-532
+#   (insertion of sensitive information into a log file).
+#
+# * **Why it is not fixed here.** ``run.py`` is named out of scope by AAP
+#   §0.8.2, which additionally states that "no logging statement is
+#   altered anywhere"; §0.10.2 makes the ``endpoints/schedule.py``
+#   ``GAME_ID`` padding fix "the single exception exercised" and states
+#   that "no other source change is permitted". Constraint C2 outranks
+#   the optional fix, so the AAP's own fallback applies and this
+#   characterization is the sanctioned response.
+#
+# * **The minimal fix, for whoever is authorised to apply it.** In each
+#   of the six handlers replace ``log.exception(...)`` with
+#   ``log.error(...)`` carrying no ``exc_info`` — emitting only the
+#   event, the subcommand, the season, the exception CLASS name and
+#   ``detail=suppressed`` — and move the full ``exc_info`` render to a
+#   separate ``log.debug`` record that the default ``INFO`` level
+#   discards. Separately, add a ``main(argv=None)`` process boundary that
+#   delegates to ``cli.main(standalone_mode=True)`` and converts an
+#   escaped ``Exception`` into ``SystemExit(1) from None``, then dispatch
+#   ``if __name__ == "__main__":`` through it; without that boundary
+#   CPython renders a SECOND stack on stderr that no in-process test can
+#   observe, because ``CliRunner`` intercepts the exception first.
+#
+# * **When that fix lands, THIS TEST MUST FAIL — that is its purpose.**
+#   Replace the four disclosure assertions below with their redacted
+#   counterparts: ``log_text.count(TRACEBACK_HEADER) == 0``,
+#   ``log_text.count(TRACEBACK_FRAME_PREFIX) == 0``,
+#   ``str(run_module.__file__) not in log_text`` and
+#   ``log_text.count(INJECTED_FAILURE_MESSAGE) == 0``, while keeping the
+#   ``run.failed`` event assertion at ``1`` so the operator still gets an
+#   actionable single line.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("subcommand,pipeline_key", FAILURE_HANDLER_TARGETS)
+def test_failure_handler_publishes_the_whole_traceback_to_console_and_durable_log(
+    cli_runner,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_output_dir,
+    tmp_log_dir,
+    subcommand: str,
+    pipeline_key: str,
+) -> None:
+    """CHARACTERIZATION — a failed subcommand leaks its stack to BOTH sinks.
+
+    Pins, for all six ``except Exception`` handlers at once, that the
+    rendered stack is published to the console handler AND to the durable
+    ``config.LOG_FILE``, and that the two renderings are byte-identical
+    because a single ``LogRecord`` is formatted by two handlers holding
+    equivalent formatters at the same level.
+
+    Mutations detected:
+
+    * Detaching either handler in ``utils/logger.py::_configure``, or
+      giving one of them a different level, breaks the dual-sink identity
+      assertion — the console and the durable log would no longer carry
+      the same bytes.
+    * Raising ``config.LOG_LEVEL`` above ``ERROR``, or filtering the
+      ``run.failed`` event out, drops the event-occurrence assertion from
+      ``1`` to ``0``.
+    * Applying the redaction fix described in this section's banner turns
+      every disclosure assertion below red, which is exactly the intended
+      tripwire: the fixer is then routed to the replacement assertions
+      spelled out there.
+    * Widening the dispatch depth between ``run.py``'s ``try`` and the
+      raising callee changes the disclosed frame count away from
+      :data:`EXPECTED_TRACEBACK_FRAMES`.
+    """
+    # Arrange — census spies on all five pipelines so a mis-dispatch lands
+    # on a spy and never on a production pipeline that would try to reach
+    # the NBA Stats API, then break the one pipeline this case targets.
+    injected_failure = _InjectedPipelineFailure(INJECTED_FAILURE_MESSAGE)
+    recorder: List[str] = []
+    _install_recorders(monkeypatch, recorder)
+    monkeypatch.setattr(
+        PIPELINE_MODULES[pipeline_key],
+        "run",
+        _make_failing_recorder(recorder, pipeline_key, injected_failure),
+    )
+    expected_event = (
+        f"run.failed subcommand={subcommand} season={config.DEFAULT_SEASON}"
+    )
+
+    # Act
+    result = cli_runner.invoke(cli, [subcommand, "--season", config.DEFAULT_SEASON])
+
+    # Assert — the invocation really did take the failure path.
+    assert result.exit_code == EXIT_FAILURE, (
+        f"`cli {subcommand}` must exit {EXIT_FAILURE} when "
+        f"{pipeline_key} raises; got {result.exit_code}. "
+        f"stderr={result.stderr!r}"
+    )
+
+    log_text = (tmp_log_dir / "pipeline.log").read_text(encoding="utf-8")
+
+    # The event line itself — this assertion stays green after the fix.
+    assert log_text.count(expected_event) == EXPECTED_FAILURE_EVENT_OCCURRENCES, (
+        f"`cli {subcommand}` must log {expected_event!r} exactly "
+        f"{EXPECTED_FAILURE_EVENT_OCCURRENCES} time in "
+        f"{config.LOG_FILE}; counted "
+        f"{log_text.count(expected_event)}"
+    )
+
+    # The four disclosure assertions. Each documents a leak, not a
+    # desired property; see this section's banner.
+    assert log_text.count(TRACEBACK_HEADER) == EXPECTED_TRACEBACK_HEADERS, (
+        f"CHARACTERIZATION drift: `cli {subcommand}` renders "
+        f"{log_text.count(TRACEBACK_HEADER)} stack(s) into the durable "
+        f"log; this defect currently produces exactly "
+        f"{EXPECTED_TRACEBACK_HEADERS}. If the redaction fix has landed, "
+        f"update this section's assertions to the redacted counterparts"
+    )
+    assert log_text.count(TRACEBACK_FRAME_PREFIX) == EXPECTED_TRACEBACK_FRAMES, (
+        f"CHARACTERIZATION drift: `cli {subcommand}` discloses "
+        f"{log_text.count(TRACEBACK_FRAME_PREFIX)} absolute source "
+        f"path(s); this defect currently discloses exactly "
+        f"{EXPECTED_TRACEBACK_FRAMES}"
+    )
+    assert str(run_module.__file__) in log_text, (
+        f"CHARACTERIZATION drift: the absolute path of run.py "
+        f"({run_module.__file__}) is no longer disclosed by `cli "
+        f"{subcommand}`. If the redaction fix has landed, invert this "
+        f"assertion to `not in`"
+    )
+    assert (
+        log_text.count(INJECTED_FAILURE_MESSAGE)
+        == EXPECTED_INJECTED_MESSAGE_OCCURRENCES
+    ), (
+        f"CHARACTERIZATION drift: the raised exception's message appears "
+        f"{log_text.count(INJECTED_FAILURE_MESSAGE)} time(s) in the "
+        f"durable log; this defect currently surfaces it exactly "
+        f"{EXPECTED_INJECTED_MESSAGE_OCCURRENCES} time"
+    )
+
+    # Dual-sink identity: ONE record, TWO handlers, byte-identical
+    # renderings. This is what makes the durable log as sensitive as the
+    # console, and it is the structural reason redacting only one sink
+    # would be insufficient.
+    assert result.stdout == log_text, (
+        f"`cli {subcommand}` must render the SAME bytes to the console "
+        f"handler and to {config.LOG_FILE}, because one LogRecord is "
+        f"formatted by two handlers at the same level; console carries "
+        f"{len(result.stdout)} bytes and the durable log carries "
+        f"{len(log_text)}"
     )

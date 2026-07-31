@@ -867,3 +867,178 @@ def test_row_narrower_than_headers_reports_index_count_and_declared_width(
         f"a shape mismatch is a DATA error and must raise ValueError, not "
         f"{type(exc_info.value).__name__}"
     )
+
+
+# ---------------------------------------------------------------------------
+# CHARACTERIZATION of a SECOND KNOWN DEFECT — CWE-117, improper output
+# neutralization for logs, in ``_build_dataframe``'s message templates.
+#
+# * **This section asserts behaviour that is WRONG, on purpose.** Like the
+#   occupied-suffix pair above, it is the remedy AAP §0.4.5 prescribes for
+#   a defect whose fix lies outside the authorised scope: "leave the
+#   source untouched and instead add a test documenting the current
+#   behavior with a comment naming the defect."
+#
+# * **The defect.** Both ``ValueError`` templates in ``_build_dataframe``
+#   interpolate the upstream-controlled result-set name with a BARE
+#   ``{name}`` and no neutralisation::
+#
+#       f"Result set '{name}' row {idx} is {type(row).__name__}, ..."
+#       f"Result set '{name}' row {idx} has {len(row)} values but ..."
+#
+#   ``_snake_case`` lowercases and re-punctuates the value but does NOT
+#   strip control characters, so a newline inside an upstream ``name``
+#   survives into the message. When ``run.py``'s ``except Exception``
+#   handler publishes that exception (see the Section F characterization
+#   in ``tests/unit/test_cli_failure_paths.py``), the embedded newline
+#   ends the genuine record early and everything after it is emitted as a
+#   NEW, fully attacker-shaped log line — a forged audit record in the
+#   operator's console and in the durable log.
+#
+# * **Reachability, stated honestly.** Result-set names arrive from the
+#   NBA Stats envelope, not from an end user, and ``session.verify=True``
+#   blocks a MITM rewrite. This is therefore a MINOR hardening gap, not a
+#   directly attacker-reachable vulnerability. It is characterised because
+#   an untrusted-input-shaped defect that no test names is one nobody
+#   finds later.
+#
+# * **Why it is not fixed here.** AAP §0.8.2 places ALL of ``utils/*.py``
+#   out of scope; §0.10.2 makes the ``endpoints/schedule.py`` ``GAME_ID``
+#   padding fix "the single exception exercised" and states that "no other
+#   source change is permitted". Constraint C2 outranks the optional fix.
+#
+# * **The minimal fix, for whoever is authorised to apply it.** Render the
+#   name through ``repr`` in both templates — ``f"Result set {name!r} row
+#   ..."`` — or escape explicitly with
+#   ``name.replace("\n", "\\n").replace("\r", "\\r")``. The ``repr`` form
+#   is PROVEN compatible with the seven exact messages pinned in
+#   :data:`EXPECTED_MESSAGES`: every one of those fixtures uses the plain
+#   name ``"t"``, and ``"Result set '%s' ..." % "t"`` and ``"Result set %r
+#   ..." % "t"`` are the SAME string, because ``repr("t")`` is ``"'t'"``.
+#   Escaping therefore activates only for names that actually contain a
+#   quote or a control character.
+#
+# * **When that fix lands, THIS TEST MUST FAIL — that is its purpose.**
+#   Replace the expectations below with the neutralised single-line form:
+#   assert the message spans exactly ONE line
+#   (``len(str(exc).splitlines()) == 1``) and that it contains the
+#   escaped two-character sequence ``\\n`` rather than a real newline.
+# ---------------------------------------------------------------------------
+
+#: An upstream result-set name carrying an embedded newline followed by a
+#: forged audit payload. Chosen so ``_snake_case`` is the IDENTITY on it:
+#: the value is already lower-case and contains no CamelCase boundary and
+#: no letter/digit boundary, so the helper returns it unchanged and the
+#: expected message below is derivable from the template alone rather than
+#: from any observed output.
+LOG_INJECTION_TABLE_NAME: str = "legit\nforged_admin_login_success"
+
+#: The attacker-controlled text that must begin the forged SECOND line.
+LOG_INJECTION_FORGED_PAYLOAD: str = "forged_admin_login_success"
+
+#: The message splits across exactly TWO lines: the template's own text up
+#: to the injected newline, then the remainder. Derivation, taking the
+#: row-type template ``f"Result set '{name}' row {idx} is
+#: {type(row).__name__}, expected list/tuple"`` with ``name`` as
+#: :data:`LOG_INJECTION_TABLE_NAME`, ``idx == 0`` and a ``dict`` row:
+#:
+#: * line 0 — ``"Result set '"`` plus the name's pre-newline part
+#:   ``"legit"`` -> ``"Result set 'legit"``.
+#: * line 1 — the name's post-newline part ``"forged_admin_login_success"``
+#:   then the template's closing quote and tail -> ``"forged_admin_login_
+#:   success' row 0 is dict, expected list/tuple"``.
+EXPECTED_LOG_INJECTION_LINES: Dict[str, list] = {
+    "row_not_sequence": [
+        "Result set 'legit",
+        "forged_admin_login_success' row 0 is dict, expected list/tuple",
+    ],
+    "row_width_mismatch": [
+        "Result set 'legit",
+        "forged_admin_login_success' row 0 has 1 values but 2 headers are declared",
+    ],
+}
+
+#: One genuine record plus one forged record.
+EXPECTED_LOG_INJECTION_LINE_COUNT: int = 2
+
+
+@pytest.mark.parametrize(
+    "branch,headers,row_set",
+    [
+        ("row_not_sequence", ["A"], [{"A": 1}]),
+        ("row_width_mismatch", ["A", "B"], [[1]]),
+    ],
+)
+def test_newline_in_result_set_name_forges_a_second_log_line(
+    branch: str,
+    headers: list,
+    row_set: list,
+) -> None:
+    """CHARACTERIZATION — an embedded newline in a table name splits the message.
+
+    Covers BOTH ``ValueError`` templates in ``_build_dataframe``, because
+    both interpolate ``{name}`` with no neutralisation and either one is
+    sufficient to forge a record.
+
+    Mutations detected:
+
+    * Applying the ``repr``/escaping fix described in this section's
+      banner — the message collapses to ONE line and every expectation
+      here turns red, routing the fixer to the replacement assertions.
+    * Dropping the result-set name from either template, which would
+      reduce the split to a single line and lose the diagnostic that names
+      the offending table.
+    * Making ``_snake_case`` strip or replace control characters, which
+      would neutralise the payload upstream of the template and likewise
+      collapse the message to one line.
+    """
+    # Arrange -- a single table whose NAME carries the injected newline.
+    payload: Dict[str, Any] = {
+        "resultSets": [
+            {
+                "name": LOG_INJECTION_TABLE_NAME,
+                "headers": headers,
+                "rowSet": row_set,
+            }
+        ]
+    }
+    expected_lines = EXPECTED_LOG_INJECTION_LINES[branch]
+
+    # Act
+    with pytest.raises(ValueError) as exc_info:
+        normalize_result_sets(payload)
+
+    observed_lines = str(exc_info.value).splitlines()
+
+    # Assert -- the COMPLETE ordered line list, not a membership check.
+    assert observed_lines == expected_lines, (
+        f"the {branch} template currently emits {expected_lines!r} when the "
+        f"result-set name carries a newline; got {observed_lines!r}. If the "
+        f"neutralisation fix has landed, this section's assertions must be "
+        f"replaced with the single-line escaped form"
+    )
+    assert len(observed_lines) == EXPECTED_LOG_INJECTION_LINE_COUNT, (
+        f"this test exists because ONE exception message becomes "
+        f"{EXPECTED_LOG_INJECTION_LINE_COUNT} log lines -- one genuine, one "
+        f"forged; got {len(observed_lines)}"
+    )
+
+    # Assert -- the forged line begins with attacker-chosen text, which is
+    # what makes it indistinguishable from a genuine record once a log
+    # formatter has already written its own prefix on the line before.
+    assert observed_lines[1].startswith(LOG_INJECTION_FORGED_PAYLOAD), (
+        f"the forged second line must begin with "
+        f"{LOG_INJECTION_FORGED_PAYLOAD!r}; got {observed_lines[1]!r}"
+    )
+
+    # Assert -- the raw message really does carry an unescaped newline,
+    # rather than the two-character sequence a neutralising fix produces.
+    assert "\n" in str(exc_info.value), (
+        f"the message must still carry a RAW newline for this "
+        f"characterization to hold; got {str(exc_info.value)!r}"
+    )
+    assert "\\n" not in str(exc_info.value), (
+        f"an escaped '\\\\n' sequence means the neutralisation fix has "
+        f"landed and this characterization must be updated; got "
+        f"{str(exc_info.value)!r}"
+    )
