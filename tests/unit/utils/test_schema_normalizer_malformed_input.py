@@ -37,25 +37,32 @@ Contracts pinned here
   supplied as the string ``"31"`` therefore stays an ``object``-dtype
   ``str``. The normalizer's job is faithful structural translation, and
   that is asserted rather than assumed.
-* **Duplicate names are uniquified, never overwritten.** A name that
-  repeats within one envelope is suffixed with the next free ordinal
-  (``PlayByPlay`` twice -> ``play_by_play`` and ``play_by_play_2``)
-  instead of the second table replacing the first, and the near-miss
-  spelling that merely *resembles* a generated key stays distinct from
-  it: an upstream name already ending in a digit snake-cases to
-  ``play_by_play2`` (no underscore) while the generated suffix is
-  ``play_by_play_2`` (with one). The key list
+* **Duplicate names are uniquified, never overwritten — while the
+  generated key is free.** A name that repeats within one envelope is
+  suffixed with the next ordinal (``PlayByPlay`` twice ->
+  ``play_by_play`` and ``play_by_play_2``) instead of the second table
+  replacing the first, and the near-miss spelling that merely
+  *resembles* a generated key stays distinct from it: an upstream name
+  already ending in a digit snake-cases to ``play_by_play2`` (no
+  underscore) while the generated suffix is ``play_by_play_2`` (with
+  one). The key list
   ``['play_by_play', 'play_by_play2', 'play_by_play_2']`` is pinned
   here.
-* **The occupied-generated-suffix case is LOSS-FREE, and that is
-  asserted as an equality.** When the ordinal the uniquifier computes
-  names a key an earlier table already holds, the uniquifier probes
-  upward to the first free ordinal instead of overwriting that frame, so
-  ``len(mapping)`` always equals the number of tables in the envelope.
-  Two tests below pin that exactly — the ordered key list, the frame
-  count against the upstream table count, and one distinguishing cell
-  per frame, because a correct key list alone cannot detect an
-  overwrite.
+* **The occupied-generated-suffix case is a KNOWN DEFECT, and is
+  characterised rather than glossed over.** When the ordinal the
+  uniquifier computes names a key an earlier table already holds, the
+  assignment overwrites that earlier frame and one upstream table
+  disappears from the mapping with no exception raised. Two tests below
+  pin that behaviour exactly — including the frame count against the
+  upstream table count — so the suite documents the loss instead of
+  masking it. They deliberately encode CURRENT behaviour, which the AAP
+  sanctions in §0.4.5 ("leave the source untouched and instead add a
+  test documenting the current behavior with a comment naming the
+  defect"), because ``utils/schema_normalizer.py`` is frozen: AAP §0.8.2
+  places all of ``utils/*.py`` out of scope and §0.10.2 exercises
+  exactly one source exception (CD-1, in ``endpoints/schedule.py``).
+  Each test names the minimal fix that would remove the defect and states
+  that applying it must update the test in the same change.
 * **No test doubles at all.** ``normalize_result_sets`` is a pure
   function over a JSON-like envelope with no I/O, so mocking at the
   boundary of the code under test would violate the repository
@@ -214,17 +221,15 @@ EXPECTED_NEAR_MISS_CELLS: list[int] = [1, 2, 3]
 
 #: Number of upstream tables in the two OCCUPIED-SUFFIX envelopes below.
 #: Held as constants so each test can compare the returned frame count
-#: against the number of tables sent, which is what makes the loss-free
-#: guarantee an equality rather than a key-list coincidence.
+#: against the number of tables sent, which is what quantifies the loss.
 OCCUPIED_SUFFIX_TABLE_COUNT = 3
 CONSECUTIVE_SUFFIX_TABLE_COUNT = 5
 
 #: Keys produced by the OCCUPIED-generated-suffix envelope, whose tables
 #: are named ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay`` in that
 #: order. Unlike the near miss above, the second table's own upstream name
-#: snake-cases to EXACTLY the key the uniquifier's first candidate would
-#: use for the third, so the two contend for one key and the probe loop is
-#: what keeps both tables. Derivation, traced through the same
+#: snake-cases to EXACTLY the key the uniquifier will generate for the
+#: third, so the two collide. Derivation, traced through the same
 #: camel-boundary substitutions and the uniquifier:
 #:
 #: * table 1 ``"PlayByPlay"`` -> ``"play_by_play"``; the key is free, so
@@ -234,52 +239,46 @@ CONSECUTIVE_SUFFIX_TABLE_COUNT = 5
 #:   lower/strip -> ``"play_by_play_2"``. That name is NOT yet a key, so it
 #:   takes the bare form: ``dataframes["play_by_play_2"] = <table 2>``.
 #: * table 3 ``"PlayByPlay"`` -> ``"play_by_play"``, which IS a key, so the
-#:   starting ordinal is ``seen_names.get("play_by_play", 1) + 1 == 2``.
-#:   ``"play_by_play_2"`` is already held by table 2, so the ``while``
-#:   probe advances the ordinal to ``3`` and the free key
-#:   ``"play_by_play_3"`` receives table 3.
+#:   ordinal is ``seen_names.get("play_by_play", 1) + 1 == 2`` and the
+#:   generated key is ``"play_by_play_2"`` — ALREADY HELD by table 2. The
+#:   assignment ``dataframes[deduped] = df`` is unconditional, so table 2's
+#:   frame is replaced and vanishes.
 #:
-#: Result: THREE keys for THREE upstream tables — nothing is overwritten
-#: and nothing is lost.
+#: Result: TWO keys for THREE upstream tables. This is the defect the
+#: module docstring names; the constants are its characterisation, not an
+#: endorsement.
 EXPECTED_OCCUPIED_SUFFIX_KEYS: list[str] = [
     "play_by_play",
     "play_by_play_2",
-    "play_by_play_3",
 ]
 
-#: First-column cell of each frame, in key order. Each key holds its OWN
-#: table's data: table 1's ``1``, table 2's ``2`` under the key that table
-#: 2 named itself, and table 3's ``3`` under the probed-forward key. A
-#: uniquifier that assigned its first candidate ordinal without probing
-#: would return ``[1, 3]`` instead, the missing ``2`` being table 2's
-#: silently replaced frame.
-EXPECTED_OCCUPIED_SUFFIX_CELLS: list[int] = [1, 2, 3]
+#: First-column cell of each surviving frame, in key order. Table 1 keeps
+#: cell ``1``; the ``play_by_play_2`` key holds table 3's cell ``3``, not
+#: table 2's cell ``2`` — the missing ``2`` IS the lost table.
+EXPECTED_OCCUPIED_SUFFIX_CELLS: list[int] = [1, 3]
 
 #: Keys produced by the CONSECUTIVE-occupancy envelope, whose tables are
 #: named ``X``, ``X_2``, ``X_3``, ``X``, ``X`` in that order. It proves the
-#: probe advances past a RUN of occupied ordinals rather than only one.
-#: Derivation (``_snake_case`` lowercases each name unchanged — no
-#: CamelCase boundary matches a single letter or a letter-digit pair):
+#: loss compounds: the uniquifier advances its ordinal per repeat without
+#: checking occupancy, so each repeat displaces the sibling holding that
+#: ordinal. Derivation (``_snake_case`` lowercases each name unchanged —
+#: no CamelCase boundary matches a single letter or a letter-digit pair):
 #:
 #: * table 1 ``X`` -> ``x`` (free) -> ``x`` holds cell 1.
 #: * table 2 ``X_2`` -> ``x_2`` (free, a different upstream NAME) -> cell 2.
 #: * table 3 ``X_3`` -> ``x_3`` (free) -> cell 3.
-#: * table 4 ``X`` repeats ``x``: the starting ordinal ``1 + 1 == 2`` names
-#:   the occupied ``x_2``, so the probe advances to ``3`` (also occupied)
-#:   and then to ``4`` -> ``x_4`` holds cell 4, and ``seen_names["x"]``
-#:   becomes ``4``.
-#: * table 5 ``X`` repeats ``x``: the starting ordinal ``4 + 1 == 5`` names
-#:   the free ``x_5`` -> cell 5.
+#: * table 4 ``X`` repeats ``x``: ordinal ``1 + 1 == 2`` -> ``x_2``, already
+#:   held by table 2, which is replaced by cell 4.
+#: * table 5 ``X`` repeats ``x``: ordinal ``2 + 1 == 3`` -> ``x_3``, already
+#:   held by table 3, which is replaced by cell 5.
 #:
-#: Result: FIVE keys for FIVE upstream tables. Without the probe this
-#: envelope would return only THREE frames, tables 2 and 3 replaced.
-EXPECTED_CONSECUTIVE_SUFFIX_KEYS: list[str] = ["x", "x_2", "x_3", "x_4", "x_5"]
+#: Result: THREE keys for FIVE upstream tables — two frames lost.
+EXPECTED_CONSECUTIVE_SUFFIX_KEYS: list[str] = ["x", "x_2", "x_3"]
 
-#: First-column cell of each frame, in key order. The identity mapping
-#: ``[1, 2, 3, 4, 5]`` is the loss-free property stated as data: every
-#: upstream table's own row is reachable under its own key. Without the
-#: probe this list would read ``[1, 4, 5]``.
-EXPECTED_CONSECUTIVE_SUFFIX_CELLS: list[int] = [1, 2, 3, 4, 5]
+#: First-column cell of each surviving frame, in key order: table 1's
+#: ``1``, then table 4's ``4`` and table 5's ``5`` in the slots tables 2
+#: and 3 originally held. The absent ``2`` and ``3`` are the lost tables.
+EXPECTED_CONSECUTIVE_SUFFIX_CELLS: list[int] = [1, 4, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -550,47 +549,73 @@ def test_duplicate_name_beside_a_digit_suffixed_sibling_keeps_every_table() -> N
 
 
 # ---------------------------------------------------------------------------
-# Duplicate result-set names — the OCCUPIED-suffix case, loss-free
+# Duplicate result-set names — the OCCUPIED-suffix defect, characterised
 # ---------------------------------------------------------------------------
 #
-# The near-miss envelope above never contends for a key because the
-# sibling's spelling (``play_by_play2``) differs from the generated key
-# (``play_by_play_2``). When the two coincide, the ordinal the uniquifier
-# computes is a STARTING POINT rather than a verdict: a generated suffix
-# may already be occupied by an upstream name of its own, so the
-# uniquifier probes upward to the first free ordinal and every input
-# table keeps a frame of its own under a key of its own.
+# The near-miss envelope above is loss-free because the sibling's spelling
+# (``play_by_play2``) differs from the generated key (``play_by_play_2``).
+# When the two coincide, the uniquifier's ordinal is a verdict rather than
+# a starting point: it computes ONE candidate key and assigns to it
+# unconditionally, so an earlier table holding that key is replaced and
+# disappears from the returned mapping with no exception raised.
 #
-# That is the whole contract the two tests below pin, and it is asserted
-# as an equality — the number of frames returned equals the number of
-# tables supplied — because a key list alone cannot reveal that one
-# table's frame replaced another's. Assigning a single computed ordinal
-# without probing would return two frames for the three tables named
-# ``PlayByPlay`` / ``PlayByPlay_2`` / ``PlayByPlay``, with no exception
-# raised, contradicting the function's ``Returns`` contract of a faithful
-# structural translation of every table in the envelope.
+# The two tests below characterise that behaviour EXACTLY, in the shape AAP
+# §0.4.5 prescribes for a defect whose source file is frozen: "leave the
+# source untouched and instead add a test documenting the current behavior
+# with a comment naming the defect. Constraint C2 outranks the optional
+# fix." ``utils/schema_normalizer.py`` is frozen by AAP §0.8.2 (all of
+# ``utils/*.py`` out of scope) and §0.10.2 (CD-1 in
+# ``endpoints/schedule.py`` is the sole source exception), and this
+# module's own file brief repeats the prohibition verbatim.
+#
+# THE DEFECT, with the failing case that exposes it:
+#
+#   envelope tables named ``PlayByPlay``, ``PlayByPlay_2``, ``PlayByPlay``
+#   -> ``{'play_by_play': <table 1>, 'play_by_play_2': <table 3>}``
+#   Table 2's DataFrame is gone: 3 tables in, 2 frames out, silently.
+#
+# THE MINIMAL FIX (for whoever authorises it) — make the ordinal a
+# starting point and probe forward to the first FREE key, replacing the
+# ``seen_names``/``deduped`` pair in the ``if name in dataframes`` branch
+# of ``normalize_result_sets`` with:
+#
+#   ordinal = seen_names.get(name, 1) + 1
+#   while f"{name}_{ordinal}" in dataframes:
+#       ordinal += 1
+#   seen_names[name] = ordinal
+#   dataframes[f"{name}_{ordinal}"] = df
+#
+# That yields ``['play_by_play', 'play_by_play_2', 'play_by_play_3']`` with
+# cells ``[1, 2, 3]`` and leaves every currently-asserted key sequence
+# (``['x','x_2','x_3']`` in the frozen sibling module, and the near miss
+# above) untouched. Applying it MUST update the two tests below in the same
+# change: they assert today's lossy behaviour on purpose, so they act as a
+# tripwire that forces the fix to be deliberate rather than incidental.
 # ---------------------------------------------------------------------------
 
 
-def test_repeat_whose_generated_key_is_occupied_keeps_every_table() -> None:
-    """3 tables named PlayByPlay / PlayByPlay_2 / PlayByPlay return 3 distinct frames.
+def test_repeat_whose_generated_key_is_occupied_drops_the_occupying_table() -> None:
+    """3 tables named PlayByPlay / PlayByPlay_2 / PlayByPlay return only 2 frames.
 
-    Hand-derived in :data:`EXPECTED_OCCUPIED_SUFFIX_KEYS` and
+    Characterises the KNOWN DEFECT named in the section comment above,
+    hand-derived in :data:`EXPECTED_OCCUPIED_SUFFIX_KEYS` and
     :data:`EXPECTED_OCCUPIED_SUFFIX_CELLS`: the repeated ``PlayByPlay``
-    starts at ordinal ``2``, finds ``play_by_play_2`` occupied by table 2's
-    own upstream name, and probes on to the free ``play_by_play_3``. Three
-    tables in, three frames out, cells ``[1, 2, 3]``.
+    generates ``play_by_play_2``, which table 2 already holds under its own
+    upstream name, and the unconditional ``dataframes[deduped] = df``
+    replaces it. The returned mapping therefore has 2 entries for 3
+    upstream tables and the cell sequence is ``[1, 3]`` — the missing ``2``
+    is the lost table.
 
     Asserting the frame count against
-    :data:`OCCUPIED_SUFFIX_TABLE_COUNT` is what makes the loss-free
-    guarantee an equality — ``len(mapping) == len(tables)`` — rather than
-    something merely implied by a key list.
+    :data:`OCCUPIED_SUFFIX_TABLE_COUNT` is what makes the loss explicit
+    and quantified rather than implied by a key list.
 
-    Mutations detected: deleting the ``while`` probe so the single ordinal
-    is assigned unconditionally (two frames for three tables, cells
-    ``[1, 3]``); dropping the uniquifier entirely so a repeat
-    overwrites the BARE key (cells ``[3, 2]``); renumbering the ordinal
-    from ``_1``; and changing the ``_`` separator (the key list changes).
+    Mutations detected: dropping the uniquifier entirely so a repeat
+    overwrites the BARE key (cells would read ``[3, 2]``); renumbering the
+    ordinal from ``_1`` or changing the separator (the key list changes);
+    and any change to how a repeated name is keyed at all. Applying the
+    probe fix quoted above also fails this test by design — see the section
+    comment: the fix and this test must land together.
     """
     # Arrange -- table 2's upstream name IS the key table 3 will generate.
     payload: Dict[str, Any] = {
@@ -606,53 +631,51 @@ def test_repeat_whose_generated_key_is_occupied_keeps_every_table() -> None:
 
     # Assert -- the complete ordered key list, not a membership check.
     assert list(out.keys()) == EXPECTED_OCCUPIED_SUFFIX_KEYS, (
-        f"an occupied generated suffix must be probed past, yielding "
+        f"an occupied generated suffix currently yields "
         f"{EXPECTED_OCCUPIED_SUFFIX_KEYS}; got {list(out.keys())}"
     )
 
-    # Assert -- loss-free, quantified: frames returned == tables supplied.
-    assert len(out) == OCCUPIED_SUFFIX_TABLE_COUNT, (
-        f"every upstream table must survive: {OCCUPIED_SUFFIX_TABLE_COUNT} "
-        f"tables were supplied but {len(out)} frames were returned. A count "
-        f"below {OCCUPIED_SUFFIX_TABLE_COUNT} means a generated key "
-        f"overwrote a sibling table's frame"
+    # Assert -- the loss, quantified: frames returned vs tables supplied.
+    assert len(out) == len(EXPECTED_OCCUPIED_SUFFIX_KEYS), (
+        f"expected {len(EXPECTED_OCCUPIED_SUFFIX_KEYS)} frames; got {len(out)}"
+    )
+    assert len(out) < OCCUPIED_SUFFIX_TABLE_COUNT, (
+        f"this test exists because one table is LOST: "
+        f"{OCCUPIED_SUFFIX_TABLE_COUNT} tables were supplied but only "
+        f"{len(out)} frames returned. If this assertion fails because "
+        f"len(out) == {OCCUPIED_SUFFIX_TABLE_COUNT}, the loss-free probe fix "
+        f"has been applied and this test must be updated to expect "
+        f"['play_by_play', 'play_by_play_2', 'play_by_play_3'] with cells "
+        f"[1, 2, 3]"
     )
 
-    # Assert -- each key holds its OWN table's data, so nothing was
-    # displaced into another table's slot.
+    # Assert -- which table survived under the collided key.
     observed_cells = [
         int(out[key].iloc[0, 0]) for key in EXPECTED_OCCUPIED_SUFFIX_KEYS
     ]
     assert observed_cells == EXPECTED_OCCUPIED_SUFFIX_CELLS, (
-        f"each key must hold its own table's row; expected cells "
-        f"{EXPECTED_OCCUPIED_SUFFIX_CELLS} but got {observed_cells}. A "
-        f"missing 2 means table 2's frame was replaced by table 3's"
+        f"the collided key currently holds the LAST writer's data; expected "
+        f"cells {EXPECTED_OCCUPIED_SUFFIX_CELLS} (table 2's 2 is missing) "
+        f"but got {observed_cells}"
     )
 
 
-def test_repeats_against_consecutive_occupied_suffixes_keep_every_table() -> None:
-    """5 tables named X / X_2 / X_3 / X / X return 5 distinct frames.
+def test_repeats_against_consecutive_occupied_suffixes_drop_two_tables() -> None:
+    """5 tables named X / X_2 / X_3 / X / X return only 3 frames.
 
-    The compounding form of the same contention, hand-derived in
+    The compounding form of the same defect, hand-derived in
     :data:`EXPECTED_CONSECUTIVE_SUFFIX_KEYS` and
-    :data:`EXPECTED_CONSECUTIVE_SUFFIX_CELLS`: the fourth table's starting
-    ordinal ``2`` names the occupied ``x_2``, so the probe walks the whole
-    run — ``2`` occupied, ``3`` occupied, ``4`` free — and the fifth table
-    then starts from the recorded ``4`` and takes ``x_5``. Five keys for
-    five upstream tables with cells ``[1, 2, 3, 4, 5]``.
+    :data:`EXPECTED_CONSECUTIVE_SUFFIX_CELLS`: the ordinal advances once
+    per repeat (``2``, then ``3``) without ever checking occupancy, so the
+    fourth table displaces ``x_2`` and the fifth displaces ``x_3``. Three
+    keys for five upstream tables, with cells ``[1, 4, 5]`` — the absent
+    ``2`` and ``3`` are the two lost tables.
 
-    This is the case a single-step probe (``if`` instead of ``while``) would
-    still lose, which is why the run of occupied ordinals is two long.
-
-    Mutations detected: replacing the ``while`` probe with a single ``if``
-    (table 4 would advance only to the occupied ``x_3`` and displace table
-    3, yielding four frames and cells ``[1, 2, 4, 5]``); deleting the probe
-    altogether (three frames, cells ``[1, 4, 5]``); and keying a
-    repeat off the bare name (one frame). Deliberately NOT claimed:
-    dropping the ``seen_names[name] = ordinal`` bookkeeping is invisible
-    here, because the probe would simply re-walk the occupied run and reach
-    the same free key — that statement is an optimisation, not a
-    correctness guarantee, and this test does not pretend otherwise.
+    Mutations detected: any change to the per-repeat ordinal progression
+    (a fixed suffix would collapse both repeats onto one key, yielding two
+    frames and cells ``[1, 5]``); resetting ``seen_names`` per table; and
+    keying a repeat off the bare name. As with its sibling above, applying
+    the loss-free probe fix fails this test by design.
     """
     # Arrange -- two bare siblings occupy the first two generated ordinals.
     payload: Dict[str, Any] = {
@@ -670,26 +693,32 @@ def test_repeats_against_consecutive_occupied_suffixes_keep_every_table() -> Non
 
     # Assert -- the complete ordered key list.
     assert list(out.keys()) == EXPECTED_CONSECUTIVE_SUFFIX_KEYS, (
-        f"the probe must walk the whole run of occupied suffixes, yielding "
+        f"consecutive occupied suffixes currently yield "
         f"{EXPECTED_CONSECUTIVE_SUFFIX_KEYS}; got {list(out.keys())}"
     )
 
-    # Assert -- loss-free, quantified: frames returned == tables supplied.
-    assert len(out) == CONSECUTIVE_SUFFIX_TABLE_COUNT, (
-        f"every upstream table must survive: {CONSECUTIVE_SUFFIX_TABLE_COUNT} "
-        f"tables were supplied but {len(out)} frames were returned. A count "
-        f"below {CONSECUTIVE_SUFFIX_TABLE_COUNT} means at least one repeat "
-        f"displaced a sibling table's frame"
+    # Assert -- the loss, quantified.
+    assert len(out) == len(EXPECTED_CONSECUTIVE_SUFFIX_KEYS), (
+        f"expected {len(EXPECTED_CONSECUTIVE_SUFFIX_KEYS)} frames; "
+        f"got {len(out)}"
+    )
+    assert len(out) < CONSECUTIVE_SUFFIX_TABLE_COUNT, (
+        f"this test exists because TWO tables are LOST: "
+        f"{CONSECUTIVE_SUFFIX_TABLE_COUNT} tables were supplied but only "
+        f"{len(out)} frames returned. If this assertion fails because "
+        f"len(out) == {CONSECUTIVE_SUFFIX_TABLE_COUNT}, the loss-free probe "
+        f"fix has been applied and this test must be updated to expect "
+        f"['x', 'x_2', 'x_3', 'x_4', 'x_5'] with cells [1, 2, 3, 4, 5]"
     )
 
-    # Assert -- the identity mapping of key order to upstream table order.
+    # Assert -- which tables survived, in key order.
     observed_cells = [
         int(out[key].iloc[0, 0]) for key in EXPECTED_CONSECUTIVE_SUFFIX_KEYS
     ]
     assert observed_cells == EXPECTED_CONSECUTIVE_SUFFIX_CELLS, (
-        f"each key must hold its own table's row; expected cells "
-        f"{EXPECTED_CONSECUTIVE_SUFFIX_CELLS} but got {observed_cells}. Any "
-        f"absent value names the upstream table whose frame was replaced"
+        f"each displaced slot currently holds its LAST writer's data; "
+        f"expected cells {EXPECTED_CONSECUTIVE_SUFFIX_CELLS} (tables 2 and 3 "
+        f"are missing) but got {observed_cells}"
     )
 
 

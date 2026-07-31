@@ -164,6 +164,7 @@ import pytest
 
 import config
 from pipelines import ingest_games
+from tests.conftest import RecordingClient
 
 
 # ---------------------------------------------------------------------------
@@ -870,43 +871,62 @@ class _LoggerSpy(logging.LoggerAdapter):
         ]
 
 
-class _MiniSeasonClient:
-    """Standalone handwritten client spy that routes on ``params["GameID"]``.
+class _MiniSeasonClient(RecordingClient):
+    """Module-local ``RecordingClient`` subclass routing on ``params["GameID"]``.
 
-    A self-contained, module-local stand-in for
-    :class:`api.nba_client.NBAClient`. It mirrors the production
-    ``get(endpoint, params) -> dict`` signature verbatim and resolves its
-    response by ``GameID``, which is what lets the mini-season return a
-    *different* box score per game -- something an endpoint-keyed spy
-    cannot express.
+    A stand-in for :class:`api.nba_client.NBAClient` that mirrors the
+    production ``get(endpoint, params) -> dict`` signature verbatim and
+    resolves its response by ``GameID``, which is what lets the
+    mini-season return a *different* box score per game -- something the
+    shared spy's endpoint-keyed lookup cannot express on its own.
 
-    It records call tuples on :attr:`calls` using the same
-    ``(endpoint, params)`` shape as the shared ``RecordingClient`` spy, so
-    assertions over ``client.calls`` stay semantically compatible with
-    every other pipeline test in the suite. Owning that recording locally
-    -- rather than deriving from the shared spy -- keeps this
-    single-module concern out of the shared fixture surface.
+    It **derives from** the shared handwritten spy
+    :class:`tests.conftest.RecordingClient` rather than re-implementing
+    it, so the ``(endpoint, params)`` recording contract is *inherited*
+    rather than duplicated: :meth:`get` resolves the envelope by
+    ``GameID``, hands it to the inherited endpoint-keyed
+    :attr:`~tests.conftest.RecordingClient.responses` map, and then
+    delegates to ``super().get()``, which performs the append to
+    :attr:`calls` and the return. Assertions over ``client.calls`` are
+    therefore identical in shape to every other pipeline test in the
+    suite by construction, and a future change to the shared spy's
+    recording format propagates here automatically instead of silently
+    diverging. Subclassing is also what the mock specification mandates
+    for this module. The subclass itself stays local to this file, so the
+    shared fixture surface does not grow.
 
-    Being *handwritten* rather than a :class:`~unittest.mock.MagicMock` is
-    equally deliberate: a drift in the production client's ``get``
-    signature surfaces here as a real ``TypeError`` at call time instead
-    of being silently absorbed by attribute-access magic.
+    Being *handwritten* rather than a :class:`~unittest.mock.MagicMock`
+    is equally deliberate, and is inherited along with the base class: a
+    drift in the production client's ``get`` signature surfaces here as a
+    real ``TypeError`` at call time instead of being silently absorbed by
+    attribute-access magic.
 
     Both endpoint helpers set ``params["GameID"] = str(game_id)``, so one
     routing key serves the box-score and play-by-play calls alike.
 
     An unmapped endpoint or an unmapped ``GameID`` raises
-    :class:`AssertionError` rather than falling back to a synthetic
-    envelope: a silent fallback would let a routing bug feed plausible but
-    wrong row counts into the aggregation assertions.
+    :class:`AssertionError` *before* delegating, rather than falling
+    through to the base spy's synthetic 1x1 fallback envelope: a silent
+    fallback would let a routing bug feed plausible but wrong row counts
+    into the aggregation assertions.
 
     Attributes
     ----------
     calls:
-        Ordered ``(endpoint, params)`` tuples, one appended per
-        :meth:`get` invocation. ``params`` is a defensive shallow copy, so
-        later mutation by the caller cannot retroactively change what was
-        recorded.
+        Inherited from :class:`tests.conftest.RecordingClient`. Ordered
+        ``(endpoint, params)`` tuples, one appended per :meth:`get`
+        invocation. ``params`` is a defensive shallow copy taken by the
+        base implementation, so later mutation by the caller cannot
+        retroactively change what was recorded.
+    responses:
+        Inherited. Starts empty and is populated by :meth:`get` with the
+        ``GameID``-resolved envelope immediately before delegating, so it
+        never shadows the routing performed here.
+    raise_for:
+        Inherited. Left empty -- this module drives no transport failure;
+        Rule 6 per-game isolation is already covered in
+        ``tests/unit/pipelines/test_ingest_games.py`` and is deliberately
+        not re-tested here.
     boxscore_payloads:
         ``GAME_ID`` -> ``boxscoretraditionalv2`` envelope map, copied at
         construction time.
@@ -920,16 +940,19 @@ class _MiniSeasonClient:
         boxscore_payloads: Dict[str, Any],
         playbyplay_payloads: Dict[str, Any],
     ) -> None:
+        # The base spy owns ``calls``, ``responses`` and ``raise_for``.
+        # Constructing it with no arguments leaves the latter two empty, so
+        # neither can shadow the GameID routing implemented in ``get``,
+        # while ``calls`` is inherited verbatim rather than re-declared.
+        super().__init__()
         self.boxscore_payloads: Dict[str, Any] = dict(boxscore_payloads)
         self.playbyplay_payloads: Dict[str, Any] = dict(playbyplay_payloads)
-        self.calls: List[Tuple[str, Dict[str, Any]]] = []
 
     def get(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Record the call on :attr:`calls`, then route by endpoint and GameID."""
-        # Copy the parameter map defensively before routing, so the
-        # recorded tuple reflects the arguments exactly as they were
-        # passed even if the caller mutates its dict afterwards.
-        self.calls.append((str(endpoint), dict(params or {})))
+        """Route by endpoint and GameID, then delegate to the base spy."""
+        # Routing is resolved BEFORE delegating so an unmapped endpoint or
+        # an unmapped GameID fails loudly instead of reaching the base
+        # spy's synthetic 1x1 fallback envelope.
         if endpoint == _BOXSCORE_ENDPOINT:
             envelopes = self.boxscore_payloads
         elif endpoint == _PLAYBYPLAY_ENDPOINT:
@@ -945,7 +968,14 @@ class _MiniSeasonClient:
                 f"_MiniSeasonClient has no {endpoint!r} envelope for "
                 f"GameID={game_id!r}; mapped ids: {sorted(envelopes)!r}"
             )
-        return envelopes[game_id]
+        # Hand the GameID-resolved envelope to the inherited endpoint-keyed
+        # lookup, then delegate: ``RecordingClient.get`` appends the
+        # ``(str(endpoint), dict(params or {}))`` tuple to ``calls`` and
+        # returns exactly this envelope. The recording contract is thus
+        # inherited rather than re-derived, and the base spy's fallback
+        # branch is provably unreachable from here.
+        self.responses[endpoint] = envelopes[game_id]
+        return super().get(endpoint, params)
 
 
 # ---------------------------------------------------------------------------

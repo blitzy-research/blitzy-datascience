@@ -44,30 +44,6 @@ Operational-rule posture of this file
   invocation in a per-subcommand ``try/except`` that *logs and
   re-raises* (AAP §0.5.2.1) so Click prints a non-zero exit status;
   it never silently swallows exceptions.
-* **Failure-output confidentiality.** The log half of that
-  "log and re-raise" is deliberately **redacted**: every ``except``
-  block calls :func:`_log_failed_run`, which emits the exception's
-  *class name* on the normal ERROR channels and routes the message and
-  traceback to the DEBUG-gated diagnostic channel. Exception text is
-  arbitrary, frequently upstream-controlled data (URLs with query
-  strings, filesystem paths, payload cell values) and tracebacks
-  publish absolute source paths and line numbers, so neither belongs in
-  the console/CI stream or the durable rotating log by default
-  (CWE-209, CWE-532). See :func:`_log_failed_run` for the full
-  rationale and for what is intentionally *not* changed.
-* **Process-boundary confidentiality.** Redacting this module's own log
-  sinks does not finish the job. The bare ``raise`` that closes every
-  handler *deliberately* propagates the exception, so when this file
-  runs as a script CPython's top-level handler renders that exception on
-  ``stderr`` — its ``str()``, ``Traceback (most recent call last)``, and
-  one absolute ``File "<path>", line <n>, in <function>`` frame per
-  stack level — republishing on the process's own error stream exactly
-  what :func:`_log_failed_run` withheld from the log sinks. The
-  ``if __name__ == "__main__"`` block therefore dispatches through
-  :func:`main`, which translates a propagated failure into a silent
-  ``SystemExit(1)`` after a redacted last-resort record. See
-  :func:`main` and :func:`_log_aborted_process` for the reproduced
-  failing case and for what is intentionally *not* changed.
 
 References
 ----------
@@ -84,7 +60,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from typing import Callable, Sequence
+from typing import Callable
 
 import click
 
@@ -196,127 +172,6 @@ def _build_collaborators(
 
 
 # ---------------------------------------------------------------------------
-# Sanitized failure-logging boundary (CD-3)
-# ---------------------------------------------------------------------------
-
-
-def _log_failed_run(
-    log: logging.LoggerAdapter,
-    subcommand: str,
-    season: str,
-) -> None:
-    """Record a run failure WITHOUT disclosing the exception's detail.
-
-    Called from the ``except Exception`` block of every data subcommand
-    and of ``all``, immediately before the mandatory bare ``raise``. It
-    must be invoked while an exception is being handled, because it reads
-    the active exception from :func:`sys.exc_info`.
-
-    Why this exists instead of ``log.exception``
-    -------------------------------------------
-    ``log.exception`` is ``log.error(..., exc_info=True)``, and
-    :func:`utils.logger._configure` attaches BOTH a
-    :class:`logging.StreamHandler` bound to ``sys.stdout`` AND a
-    :class:`logging.handlers.RotatingFileHandler` writing
-    :data:`config.LOG_FILE`, each at :data:`config.LOG_LEVEL`. Using it
-    here therefore rendered the formatted traceback into **two normal
-    operator channels at once** — the interactive/CI console and the
-    durable log file — and with it:
-
-    * the exception's ``str()``, which is arbitrary text this process does
-      not control. An upstream HTTP error carries the request URL and its
-      query string; an :exc:`OSError` carries a filesystem path; a pandas
-      or normalizer error can carry cell values drawn straight from the
-      payload. Any of those may hold a token, a signed URL, or data an
-      operator's log pipeline is not entitled to retain.
-    * ``Traceback (most recent call last)`` with one ``File "<absolute
-      path>", line <n>, in <function>`` frame per stack level, which
-      publishes the deployment's directory layout and exact source
-      coordinates to anyone who can read the log.
-
-    That is CWE-209 (information exposure through an error message) and
-    CWE-532 (insertion of sensitive information into a log file).
-
-    The failing case that motivated the change: a pipeline raising
-    ``RuntimeError("upstream request failed: https://stats.nba.com/stats/"
-    "leaguedashplayerstats?<token>")`` published that token, the
-    traceback header, this file's absolute path and its line numbers to
-    ``stdout`` *and* to ``logs/pipeline.log``. It is exercised by
-    ``tests/unit/test_cli_failure_paths.py`` Section F, which fails
-    against the unredacted boundary.
-
-    What is emitted instead
-    -----------------------
-    * At **ERROR**, on the normal channels: the ``run.failed`` event, the
-      subcommand, the season, and the exception's **class name**. The
-      class name is a static identifier from this project's own source —
-      never attacker- or data-controlled — and it is what makes the
-      redacted record triage-able (``ConnectionError`` and
-      ``PermissionError`` demand very different operator responses).
-      ``detail=suppressed`` states plainly that more exists, so the record
-      cannot be mistaken for the whole story.
-    * At **DEBUG**, on the gated diagnostic channel: the full
-      ``exc_info`` traceback. :data:`config.LOG_LEVEL` defaults to
-      ``"INFO"`` and both handlers are level-filtered, so this record is
-      discarded — never formatted, never written — unless an operator
-      deliberately opts in with ``NBA_LOG_LEVEL=DEBUG`` and thereby
-      accepts durable retention of the detail. Internal causality is
-      preserved and gated, not destroyed.
-
-    What is deliberately unchanged
-    ------------------------------
-    The caller's bare ``raise`` and the ``metrics.registry.inc`` call that
-    precedes it. AAP §0.5.2.1 mandates that this boundary *log and
-    re-raise*: the original exception object — traceback, ``__cause__``
-    and attributes intact — must still reach the caller so Click exits
-    non-zero and no failure is ever silently swallowed. Redaction applies
-    to what this process *writes to its own log sinks*, not to what it
-    propagates.
-
-    What the propagated exception must NOT be allowed to do, however, is
-    reach CPython's top-level handler, which would render its message and
-    traceback on ``stderr`` and undo this redaction on a channel this
-    helper does not govern. That is the complementary boundary, and it
-    lives in :func:`main`: see its docstring for the reproduced failing
-    case (defect CD-4).
-
-    Parameters
-    ----------
-    log : logging.LoggerAdapter
-        The subcommand-scoped adapter returned by
-        :func:`_build_collaborators`; it carries the correlation ID that
-        ties this record to the rest of the run, which is how an operator
-        finds the matching DEBUG detail after re-running with
-        ``NBA_LOG_LEVEL=DEBUG``.
-    subcommand : str
-        The Click subcommand name (``"players"``, ``"all"``, ...).
-    season : str
-        The ``--season`` value, echoed for symmetry with the
-        ``run.start`` record. It is a CLI argument, not payload data.
-    """
-    # ``sys.exc_info()[1]`` rather than an ``except ... as exc`` binding:
-    # it keeps each call site a single statement and reads the exception
-    # the interpreter is currently handling, which is exactly the one the
-    # DEBUG record's ``exc_info=True`` will render.
-    active = sys.exc_info()[1]
-    error_type = type(active).__name__ if active is not None else "unknown"
-
-    log.error(
-        "run.failed subcommand=%s season=%s error_type=%s detail=suppressed "
-        "(re-run with NBA_LOG_LEVEL=DEBUG for the traceback)",
-        subcommand,
-        season,
-        error_type,
-    )
-    log.debug(
-        "run.failed.detail subcommand=%s season=%s",
-        subcommand,
-        season,
-        exc_info=True,
-    )
-
-
-# ---------------------------------------------------------------------------
 # Click group
 # ---------------------------------------------------------------------------
 
@@ -360,10 +215,8 @@ def cli(ctx: click.Context) -> None:
 #      emit "run.complete" INFO.
 #   5. On failure: increment
 #      pipeline_runs_total{pipeline=ingest_<domain>,outcome=error},
-#      emit a REDACTED "run.failed" ERROR via _log_failed_run (exception
-#      class name only — never its message or traceback, which go to the
-#      DEBUG-gated diagnostic channel), and re-raise so Click exits with
-#      a non-zero status.
+#      emit "run.failed" ERROR with exception info, and re-raise so
+#      Click exits with a non-zero status.
 #
 # The ``pipeline`` / ``outcome`` labels with values ``ingest_<domain>`` /
 # ``success|error`` are the binding contract documented in
@@ -408,7 +261,7 @@ def players(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_players", "outcome": "error"},
         )
-        _log_failed_run(log, "players", season)
+        log.exception("run.failed subcommand=players season=%s", season)
         raise
 
 
@@ -440,7 +293,7 @@ def teams(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_teams", "outcome": "error"},
         )
-        _log_failed_run(log, "teams", season)
+        log.exception("run.failed subcommand=teams season=%s", season)
         raise
 
 
@@ -481,7 +334,7 @@ def games(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_games", "outcome": "error"},
         )
-        _log_failed_run(log, "games", season)
+        log.exception("run.failed subcommand=games season=%s", season)
         raise
 
 
@@ -513,7 +366,7 @@ def lineups(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_lineups", "outcome": "error"},
         )
-        _log_failed_run(log, "lineups", season)
+        log.exception("run.failed subcommand=lineups season=%s", season)
         raise
 
 
@@ -545,7 +398,7 @@ def schedule(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "ingest_schedule", "outcome": "error"},
         )
-        _log_failed_run(log, "schedule", season)
+        log.exception("run.failed subcommand=schedule season=%s", season)
         raise
 
 
@@ -601,7 +454,7 @@ def all_cmd(season: str) -> None:
             "pipeline_runs_total",
             {"pipeline": "all", "outcome": "error"},
         )
-        _log_failed_run(log, "all", season)
+        log.exception("run.failed subcommand=all season=%s", season)
         raise
 
 
@@ -681,179 +534,9 @@ def metrics_cmd() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Module entry point and its process-level failure boundary (CD-4)
+# Module entry point
 # ---------------------------------------------------------------------------
 
 
-#: Process exit status reported when a subcommand fails. It is the status
-#: Click already produces for an escaped callback exception and the
-#: literal :func:`ready_cmd` hands to :func:`sys.exit`, so translating a
-#: propagated failure into it preserves the exit contract operators,
-#: orchestrators and CI pipelines already rely on.
-_FAILURE_EXIT_STATUS: int = 1
-
-#: Logger name for records emitted by the process boundary itself. It is
-#: the parent of the ``"cli.<subcommand>"`` names :func:`_build_collaborators`
-#: uses, so a boundary record sorts alongside the subcommand records of the
-#: same run and inherits the correlation ID already bound to this context.
-_PROCESS_LOGGER_NAME: str = "cli"
-
-
-def _log_aborted_process() -> None:
-    """Record that the process is aborting, WITHOUT disclosing the exception.
-
-    Called from :func:`main`'s ``except`` block while the exception is
-    still being handled, because it reads the active exception from
-    :func:`sys.exc_info`.
-
-    Why a second record exists alongside :func:`_log_failed_run`
-    -----------------------------------------------------------
-    The two cover different failure populations, and only their union
-    covers every way this process can die non-zero:
-
-    * :func:`_log_failed_run` runs inside a subcommand's ``except``
-      block, so it sees only failures raised *within* the ``try`` that
-      wraps a pipeline call. Its record names the subcommand and season.
-    * this helper runs at the outermost frame, so it also sees failures
-      raised *before* a subcommand's ``try`` is entered — for example an
-      :exc:`OSError` from ``CSVWriter(output_dir=...)`` inside
-      :func:`_build_collaborators`, or a :exc:`KeyError` from a
-      diagnostic subcommand. For those, this is the ONLY record written,
-      which is what keeps :func:`main`'s silent exit from becoming a
-      silent *failure*: the process never dies without saying so.
-
-    The event names are deliberately distinct (``run.aborted`` versus
-    ``run.failed``) so log-based alerting can tell "a pipeline raised"
-    apart from "the process gave up", and so neither record can be
-    mistaken for the other by a text filter.
-
-    What is emitted, and where
-    --------------------------
-    Exactly the redaction contract :func:`_log_failed_run` establishes,
-    for the same CWE-209 / CWE-532 reasons:
-
-    * At **ERROR**, on the normal channels: the ``run.aborted`` event,
-      the exit status, the exception's **class name** — a static
-      identifier from this project's own source, never attacker- or
-      payload-controlled — and ``detail=suppressed`` so the record cannot
-      be mistaken for the whole story.
-    * At **DEBUG**, on the gated diagnostic channel: the full
-      ``exc_info``. :data:`config.LOG_LEVEL` defaults to ``"INFO"`` and
-      :func:`utils.logger._configure` applies it to the root logger AND
-      to both handlers, so this record is discarded — never formatted,
-      never written — unless an operator opts in with
-      ``NBA_LOG_LEVEL=DEBUG``.
-    """
-    # ``sys.exc_info()[1]`` rather than an ``except ... as exc`` binding,
-    # mirroring ``_log_failed_run``: it keeps the call site a single
-    # statement and reads the exception the interpreter is currently
-    # handling, which is exactly the one ``exc_info=True`` will render.
-    active = sys.exc_info()[1]
-    error_type = type(active).__name__ if active is not None else "unknown"
-
-    log = logger_module.get_logger(_PROCESS_LOGGER_NAME)
-    log.error(
-        "run.aborted exit_status=%s error_type=%s detail=suppressed "
-        "(re-run with NBA_LOG_LEVEL=DEBUG for the traceback)",
-        _FAILURE_EXIT_STATUS,
-        error_type,
-    )
-    log.debug("run.aborted.detail", exc_info=True)
-
-
-def main(argv: Sequence[str] | None = None) -> None:
-    """Run the CLI as a process, translating a failure into a silent exit 1.
-
-    This is the function the ``if __name__ == "__main__"`` block below
-    invokes, and therefore the real behaviour of ``python run.py
-    <subcommand>``. It is a module-level function rather than inline code
-    so the process boundary is reachable from a test
-    (``run.main(["teams", "--season", ...])``) instead of only from a
-    shell.
-
-    The defect this exists to fix (CD-4), with its failing case
-    ----------------------------------------------------------
-    * **Behaviour before the fix.** The entry point called ``cli()``
-      directly. Every subcommand's ``except`` block ends with a bare
-      ``raise`` (AAP §0.5.2.1 mandates log-and-re-raise), Click does not
-      catch non-Click exceptions, so the exception reached CPython's
-      top-level handler and was rendered to ``stderr`` in full. Running
-      a ``teams`` pipeline that raised
-      ``RuntimeError("upstream request failed: https://stats.nba.com/"
-      "stats/leaguedashplayerstats?<token>")`` exited 1 while printing
-      the token, ``Traceback (most recent call last)``, and eight
-      ``File "<absolute path>", line <n>, in <function>`` frames —
-      including this file's absolute path and line number — onto the
-      process's error stream. :func:`_log_failed_run` had already
-      withheld all of that from the log sinks, so the disclosure was
-      republished on the one channel it did not govern: CWE-209
-      (information exposure through an error message), and CWE-532 once
-      a CI or cron wrapper retains ``stderr``.
-    * **Behaviour after the fix.** ``stderr`` carries nothing at all. The
-      operator learns the run failed from the redacted ``run.failed``
-      and ``run.aborted`` records, and the process still exits
-      :data:`_FAILURE_EXIT_STATUS`.
-    * **The change.** This function, :func:`_log_aborted_process`, and
-      one changed statement in the ``__main__`` block. Every subcommand
-      callback — its bare ``raise``, its ``metrics.registry.inc`` calls,
-      its logging — is byte-identical, which is why in-process callers
-      such as :class:`click.testing.CliRunner` see exactly the behaviour
-      they saw before.
-
-    What is deliberately NOT caught
-    -------------------------------
-    ``except Exception`` never catches :exc:`SystemExit` or
-    :exc:`KeyboardInterrupt`, both of which derive from
-    :exc:`BaseException`. Consequently:
-
-    * a successful run still exits 0 (Click's standalone mode ends in
-      ``ctx.exit()``),
-    * ``ready``'s deliberate ``sys.exit(1)`` still exits 1 with its JSON
-      body already echoed,
-    * a Click usage error still exits 2 with Click's own
-      operator-facing message on ``stderr`` — that message is generated
-      by this project, not derived from payload or upstream data, so
-      suppressing it would destroy usability without any confidentiality
-      gain,
-    * ``Ctrl-C`` still aborts the way Click documents.
-
-    Only a genuine, already-logged failure is converted, and it is
-    converted with ``from None`` so the interpreter cannot render the
-    original exception as the new one's context either.
-
-    Parameters
-    ----------
-    argv : Sequence[str], optional
-        Argument vector *excluding* the program name, handed straight to
-        :meth:`click.Group.main`. ``None`` — the value the ``__main__``
-        block uses — makes Click read ``sys.argv[1:]``, which is the
-        production path. A test supplies an explicit list to drive one
-        subcommand without touching ``sys.argv``.
-
-    Raises
-    ------
-    SystemExit
-        Always: with :data:`_FAILURE_EXIT_STATUS` when a subcommand let
-        an exception escape, and otherwise with whatever status Click or
-        a callback chose (0 on success, 1 from ``ready``, 2 for a usage
-        error).
-    """
-    try:
-        cli.main(args=argv, standalone_mode=True)
-    except Exception:
-        # ``try``/``finally`` rather than a nested ``except``: whatever
-        # happens while writing the last-resort record — a full disk, a
-        # revoked log directory — this process must still exit
-        # ``_FAILURE_EXIT_STATUS`` with nothing rendered. A ``raise``
-        # inside ``finally`` replaces the in-flight exception, and
-        # ``from None`` suppresses its context, so neither the original
-        # failure nor a logging failure can reach the traceback
-        # renderer. The status is never silently downgraded to 0.
-        try:
-            _log_aborted_process()
-        finally:
-            raise SystemExit(_FAILURE_EXIT_STATUS) from None
-
-
 if __name__ == "__main__":
-    main()
+    cli()
